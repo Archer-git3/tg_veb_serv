@@ -21,7 +21,7 @@ SESSION_TIMEOUT = 60
 ACCOUNTS_CHECK_INTERVAL = 30
 
 # Список спеціальних користувачів (user_id)
-SPECIAL_USERS = ["ponomaryvv", "іншийкористувач"]
+SPECIAL_USERS = ["fgtaaaqd", "іншийкористувач"]
 
 # Налаштування логування
 if os.path.exists(LOG_FILE):
