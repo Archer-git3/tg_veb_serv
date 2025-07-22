@@ -789,22 +789,22 @@ async def main_ui():
     # Кнопка керування групами
     if st.button("👥 Керування групами", use_container_width=True, key="manage_groups_btn"):
         # Перемикаємо стан форми керування групами
-        if st.session_state.active_form == 'manage_groups':
+        if st.session_state.get("active_form") == 'manage_groups':
             st.session_state.active_form = None
         else:
             st.session_state.active_form = 'manage_groups'
         st.rerun()
 
     # Відображення активної форми
-    if st.session_state.active_form == 'add_account':
+    if st.session_state.get("active_form") == 'add_account':
         with st.expander("Додати новий акаунт", expanded=True):
             await login()
 
-    elif st.session_state.active_form == 'add_group':
+    elif st.session_state.get("active_form") == 'add_group':
         with st.expander("Створення нової групи", expanded=True):
             create_new_group_form()
 
-    elif st.session_state.active_form == 'manage_groups':
+    elif st.session_state.get("active_form") == 'manage_groups':
         with st.expander("Керування групами", expanded=True):
             manage_groups_form()
 
