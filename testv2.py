@@ -13,6 +13,9 @@ import pickle  # Для більш ефективного збереження �
 from db import async_session,init_db
 from models import NotificationChat, TelegramAccount
 from sqlalchemy import select
+import nest_asyncio
+nest_asyncio.apply()
+
 
 # Конфігурація
 API_ID = 29148113
@@ -158,7 +161,7 @@ def load_accounts_from_file():
         return [], [], None
 
 
-def init_session_state():
+async def init_session_state():
     required_states = {
         'current_account': None,
         'login_stage': 'start',
@@ -180,9 +183,7 @@ def init_session_state():
     # Завантажуємо акаунти тільки при першому запуску
     if 'accounts' not in st.session_state or 'groups' not in st.session_state:
         #accounts, groups, last_saved = load_accounts_from_file()
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        accounts_raw = loop.run_until_complete(load_accounts_from_db())
+        accounts_raw = await load_accounts_from_db()
         accounts = [a.to_dict() for a in accounts_raw]
         groups = sorted({acc["group"] for acc in accounts})
         st.session_state.accounts = accounts
