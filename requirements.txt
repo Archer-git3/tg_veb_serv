@@ -1,4 +1,5 @@
-streamlit
-pandas
 telethon
-python-telegram-bot
+streamlit
+sqlalchemy
+asyncpg
+python-dotenv
