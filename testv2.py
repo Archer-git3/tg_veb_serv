@@ -10,8 +10,9 @@ import os
 import random
 import asyncio
 import pickle  # Для більш ефективного збереження даних
-
-
+from db import async_session,init_db
+from models import NotificationChat, TelegramAccount
+from sqlalchemy import select
 
 # Конфігурація
 API_ID = 29148113
@@ -52,6 +53,11 @@ def save_accounts_to_file():
     except Exception as e:
         st.error(f"Помилка збереження даних: {str(e)}")
 
+
+async def load_accounts_from_db():
+    async with async_session() as session:
+        result = await session.execute(select(TelegramAccount))
+        return result.scalars().all()
 
 def load_accounts_from_file():
     """Завантажує акаунти та групи з файлу, конвертує з JSON при необхідності"""
@@ -173,11 +179,14 @@ def init_session_state():
 
     # Завантажуємо акаунти тільки при першому запуску
     if 'accounts' not in st.session_state or 'groups' not in st.session_state:
-        accounts, groups, last_saved = load_accounts_from_file()
+        #accounts, groups, last_saved = load_accounts_from_file()
+        accounts_raw = await load_accounts_from_db()
+        accounts = [account.to_dict() for account in accounts_raw]  # або вручну створити словники
+        groups = sorted({acc.group for acc in accounts})
         st.session_state.accounts = accounts
         st.session_state.groups = groups
-        if last_saved:
-            st.session_state.last_saved = last_saved
+
+
 
     # Переконуємось, що всі акаунти мають обов'язкові поля
     for account in st.session_state.accounts:
