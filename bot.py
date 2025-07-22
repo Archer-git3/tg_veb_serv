@@ -8,7 +8,11 @@ from telethon.sessions import StringSession
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 import time
-import pickle  # Додано для роботи з бінарними файлами
+from sqlalchemy import select
+from db import async_session,init_db
+from models import NotificationChat, TelegramAccount
+
+
 
 # Конфігурація
 API_ID = 29148113
@@ -90,85 +94,99 @@ class AccountClient:
 
 
 async def load_accounts():
-    global last_accounts_mtime, admins
+    global admins, clients
 
     try:
-        # Перевіряємо, чи файл існує
-        if not os.path.exists(ACCOUNTS_FILE):
-            logger.warning("Файл акаунтів не знайдено")
-            return False
+        # Отримуємо всі акаунти з бази
+        async with async_session() as session:
+            result = await session.execute(select(TelegramAccount))
+            accounts = result.scalars().all()
 
-        # Отримуємо час модифікації файлу
-        current_mtime = os.path.getmtime(ACCOUNTS_FILE)
+            if not accounts:
+                logger.warning("📭 База даних акаунтів пуста")
+                return False
 
-        # Перевіряємо, чи файл змінився
-        if current_mtime <= last_accounts_mtime:
-            return False
-
-        last_accounts_mtime = current_mtime
-
-        # Читаємо бінарний файл за допомогою pickle
-        with open(ACCOUNTS_FILE, 'rb') as f:
-            data = pickle.load(f)
-
-        # Отримуємо акаунти з нової структури даних
-        accounts = data.get("accounts", [])
-        if not accounts:
-            logger.warning("Файл акаунтів не містить даних")
-            return False
-
-        # Зупиняємо старі клієнти
+        # Зупиняємо всі поточні клієнти
         for client in list(clients.values()):
-            await client.stop()
+            try:
+                await client.stop()
+            except Exception as stop_err:
+                logger.warning(f"⚠️ Помилка зупинки клієнта: {stop_err}")
         clients.clear()
-
-        # Очищаємо адмінів
         admins.clear()
 
         # Завантажуємо нові акаунти
-        for account in accounts:
-            if account.get('skip_check', False):
+        for acc in accounts:
+            # Пропускаємо, якщо встановлено skip_check
+            if acc.skip_check:
                 continue
 
-            client = AccountClient(account)
-            if await client.start():
-                clients[account['phone']] = client
-                logger.info(f"Акаунт {account['name']} успішно завантажено")
+            # Конвертація у словник
+            account_data = {
+                'group': acc.group,
+                'name': acc.name,
+                'phone': acc.phone,
+                'session_string': acc.session_string,
+                'last_updated': acc.last_updated,
+                'is_admin': acc.is_admin,
+                'skip_check': acc.skip_check
+            }
 
-                # Якщо акаунт є адміном, додаємо його user_id
-                if account.get('is_admin', False) and client.me:
-                    admins.add(client.me.id)
-                    logger.info(f"Додано адміністратора: {client.me.id}")
+            client = AccountClient(account_data)
+
+            try:
+                if await client.start():
+                    clients[acc.phone] = client
+                    logger.info(f"✅ Акаунт {acc.name} успішно завантажено")
+
+                    # Додаємо до списку адмінів
+                    if acc.is_admin and client.me:
+                        admins.add(client.me.id)
+                        logger.info(f"👑 Додано адміністратора: {client.me.id}")
+            except Exception as start_err:
+                logger.warning(f"❌ Не вдалося запустити клієнта {acc.name}: {start_err}")
 
         return True
-    except Exception as e:
-        logger.error(f"Помилка завантаження акаунтів: {e}")
-        return False
 
+    except Exception as e:
+        logger.error(f"💥 Помилка завантаження акаунтів з бази: {e}")
+        return False
 
 async def load_notification_chats():
     global notification_chats
-    try:
-        if os.path.exists(NOTIFICATION_CHATS_FILE):
-            with open(NOTIFICATION_CHATS_FILE, 'rb') as f:
-                notification_chats = pickle.load(f)
-
-                # Оновлюємо статус спеціальних користувачів
-                for chat_id, settings in notification_chats.items():
-                    username = settings.get('username')
-                    if username:
-                        settings['is_special'] = username.lower() in [u.lower() for u in SPECIAL_USERS]
-    except Exception as e:
-        logger.error(f"Помилка завантаження чатів: {e}")
-        notification_chats = {}
+    async with async_session() as session:
+        result = await session.execute(select(NotificationChat))
+        rows = result.scalars().all()
+        notification_chats = {
+            row.chat_id: {
+                'user_id': row.user_id,
+                'username': row.username,
+                'groups': row.groups,
+                'is_special': row.is_special
+            }
+            for row in rows
+        }
 
 
 async def save_notification_chats():
-    try:
-        with open(NOTIFICATION_CHATS_FILE, 'wb') as f:
-            pickle.dump(notification_chats, f)
-    except Exception as e:
-        logger.error(f"Помилка збереження чатів: {e}")
+    async with async_session() as session:
+        async with session.begin():
+            for chat_id, data in notification_chats.items():
+                row = await session.get(NotificationChat, chat_id)
+                if row:
+                    row.user_id = data['user_id']
+                    row.username = data['username']
+                    row.groups = data['groups']
+                    row.is_special = data['is_special']
+                else:
+                    new = NotificationChat(
+                        chat_id=chat_id,
+                        user_id=data['user_id'],
+                        username=data['username'],
+                        groups=data['groups'],
+                        is_special=data['is_special']
+                    )
+                    session.add(new)
 
 
 async def message_listener(client: AccountClient):
@@ -408,6 +426,7 @@ async def show_group_selection(query, context: ContextTypes.DEFAULT_TYPE):
         f"🏷️ Виберіть групи для моніторингу (вибрано: {selected_count}):\n\n"
         "ℹ️ Натисніть на групу, щоб додати або видалити її зі списку",
         reply_markup=reply_markup
+
     )
 
 
@@ -1211,33 +1230,6 @@ async def update_special_buttons(query):
     )
 
 
-async def save_special_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    # Зберігаємо зміни у файл
-    try:
-        # Завантажуємо поточні дані
-        if os.path.exists(ACCOUNTS_FILE):
-            with open(ACCOUNTS_FILE, 'rb') as f:
-                data = pickle.load(f)
-        else:
-            data = {"accounts": [], "groups": []}
-
-        # Оновлюємо статуси спеціальних акаунтів
-        for i, account in enumerate(data['accounts']):
-            for client in clients.values():
-                if account['phone'] == client.account_data['phone']:
-                    data['accounts'][i]['is_special'] = client.is_special
-
-        # Зберігаємо зміни
-        with open(ACCOUNTS_FILE, 'wb') as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-        await query.edit_message_text("✅ Зміни успішно збережено!")
-    except Exception as e:
-        logger.error(f"Помилка збереження спеціальних акаунтів: {e}")
-        await query.edit_message_text(f"❌ Помилка збереження: {str(e)}")
 
 
 
@@ -1266,7 +1258,7 @@ async def check_accounts_updates():
 async def main():
     # Ініціалізація бота
     application = Application.builder().token(BOT_TOKEN).build()
-
+    await init_db()
     # Завантаження даних
     await load_notification_chats()
     await load_accounts()
@@ -1298,7 +1290,6 @@ async def main():
     application.add_handler(CallbackQueryHandler(save_groups_handler, pattern="^save_groups$"))
     application.add_handler(CallbackQueryHandler(reset_groups_handler, pattern="^reset_groups$"))
     application.add_handler(CallbackQueryHandler(toggle_special_handler, pattern="^toggle_special:"))
-    application.add_handler(CallbackQueryHandler(save_special_handler, pattern="^save_special$"))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(CallbackQueryHandler(account_group_handler, pattern="^account_group:"))
     application.add_handler(CallbackQueryHandler(button_handler))
