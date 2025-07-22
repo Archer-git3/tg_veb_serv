@@ -3,4 +3,3 @@ streamlit
 sqlalchemy
 asyncpg
 python-dotenv
-psycopg2
