@@ -4,3 +4,4 @@ sqlalchemy
 asyncpg
 python-dotenv
 nest_asyncio
+python-telegram-bot
