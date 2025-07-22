@@ -766,7 +766,7 @@ def manage_groups_form():
 async def main_ui():
     """Головний інтерфейс програми"""
     st.title("📊 Моніторинг повідомлень Telegram")
-    init_session_state()
+    await init_session_state()
 
     # Кнопки додавання нового акаунта та нової групи
     col1, col2 = st.columns(2)
