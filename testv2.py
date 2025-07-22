@@ -180,9 +180,11 @@ def init_session_state():
     # Завантажуємо акаунти тільки при першому запуску
     if 'accounts' not in st.session_state or 'groups' not in st.session_state:
         #accounts, groups, last_saved = load_accounts_from_file()
-        accounts_raw = await load_accounts_from_db()
-        accounts = [account.to_dict() for account in accounts_raw]  # або вручну створити словники
-        groups = sorted({acc.group for acc in accounts})
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        accounts_raw = loop.run_until_complete(load_accounts_from_db())
+        accounts = [a.to_dict() for a in accounts_raw]
+        groups = sorted({acc["group"] for acc in accounts})
         st.session_state.accounts = accounts
         st.session_state.groups = groups
 
