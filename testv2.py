@@ -862,9 +862,8 @@ async def main_ui():
                     st.success(f"Акаунт {account_name} видалено!")
                     st.rerun()
 
-
+async def main_async():
+    await main_ui()
 # Запуск додатка
-if __name__ == '__main__':
-    # Запускаємо асинхронно лише один раз
-    if 'main_task' not in st.session_state:
-        st.session_state.main_task = asyncio.create_task(main_ui())
+if __name__ == "__main__":
+    asyncio.run(main_async())
