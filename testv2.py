@@ -13,8 +13,7 @@ import pickle  # Для більш ефективного збереження �
 from db import async_session,init_db
 from models import NotificationChat, TelegramAccount
 from sqlalchemy import select
-import nest_asyncio
-nest_asyncio.apply()
+
 
 
 # Конфігурація
@@ -23,7 +22,7 @@ API_HASH = "0fba92868b9d99d1e63583a8fb751fb4"
 ACCOUNTS_FILE = "telegram_accounts.json"
 
 # Глобальний цикл подій
-if not hasattr(st.session_state, 'loop'):
+if not hasattr(st.session_state, 'loop') or st.session_state.loop.is_closed():
     st.session_state.loop = asyncio.new_event_loop()
 asyncio.set_event_loop(st.session_state.loop)
 
@@ -173,25 +172,28 @@ async def init_session_state():
         'active_form': None,
         'editing_group': None,
         'group_to_delete': None,
-        'last_full_update': datetime.min
+        'last_full_update': datetime.min,
+        'db_initialized': False  # Додано прапорець ініціалізації БД
     }
 
     for key, default in required_states.items():
         if key not in st.session_state:
             st.session_state[key] = default
 
-    # Завантажуємо акаунти тільки при першому запуску
+    # Ініціалізація БД виконується лише один раз
+    if not st.session_state.db_initialized:
+        await init_db()
+        st.session_state.db_initialized = True
+
+    # Завантаження акаунтів лише при першому запуску
     if 'accounts' not in st.session_state or 'groups' not in st.session_state:
-        #accounts, groups, last_saved = load_accounts_from_file()
         accounts_raw = await load_accounts_from_db()
         accounts = [a.to_dict() for a in accounts_raw]
         groups = sorted({acc["group"] for acc in accounts})
         st.session_state.accounts = accounts
         st.session_state.groups = groups
 
-
-
-    # Переконуємось, що всі акаунти мають обов'язкові поля
+    # Ініціалізація полів акаунтів
     for account in st.session_state.accounts:
         account.setdefault('unread_count', 0)
         account.setdefault('oldest_unread', None)
@@ -862,8 +864,11 @@ async def main_ui():
                     st.success(f"Акаунт {account_name} видалено!")
                     st.rerun()
 
+
 async def main_async():
     await main_ui()
+
+    
 # Запуск додатка
 if __name__ == "__main__":
     asyncio.run(main_async())
