@@ -1,7 +1,7 @@
 import os
 import json
 import asyncio
-
+import logging
 from datetime import datetime
 from telethon import TelegramClient, events, errors, types
 from telethon.sessions import StringSession
@@ -16,13 +16,25 @@ API_HASH = "0fba92868b9d99d1e63583a8fb751fb4"
 BOT_TOKEN = "7603687034:AAG9102_4yFSuHrwE17FgO-Fc8nnfL1Z4-8"
 ACCOUNTS_FILE = "telegram_accounts.json"  # Змінимо розширення на pkl
 NOTIFICATION_CHATS_FILE = "notification_chats.json"  # Змінимо розширення на pkl
-
+LOG_FILE = "bot.log"
 SESSION_TIMEOUT = 60
 ACCOUNTS_CHECK_INTERVAL = 30
 
 # Список спеціальних користувачів (user_id)
 SPECIAL_USERS = ["fgtaaaqd", "іншийкористувач"]
 
+# Налаштування логування
+if os.path.exists(LOG_FILE):
+    os.remove(LOG_FILE)
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    encoding='utf-8',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+logger.info("=== Бот запущено ===")
 
 # Глобальні змінні
 clients = {}
@@ -61,6 +73,7 @@ class AccountClient:
             await self.client.connect()
 
             if not await self.client.is_user_authorized():
+                logger.error(f"Клієнт {self.account_data['name']} не авторизований!")
                 return False
 
             self.me = await self.client.get_me()
