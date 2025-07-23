@@ -1,8 +1,8 @@
-import os
 import json
 import asyncio
 import logging
 from logging.handlers import TimedRotatingFileHandler
+import os
 from datetime import datetime
 from telethon import TelegramClient, events, errors, types
 from telethon.sessions import StringSession
@@ -25,56 +25,63 @@ ACCOUNTS_CHECK_INTERVAL = 30
 SPECIAL_USERS = ["fgtaaaqd", "іншийкористувач"]
 
 
-# Налаштування ротації логів
-def setup_logging():
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-
-    # Видалити існуючі обробники
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-
-    # Створити кастомний обробник з ротацією
-    handler = CustomTimedRotatingHandler(
-        LOG_FILE,
-        when='H',
-        interval=12,
-        backupCount=1
-    )
-    handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    ))
-    logger.addHandler(handler)
-
-    return logger
-
-# Викликати налаштування логування
-logger = setup_logging()
 
 
-# Додати цей клас для кастомної ротації
+# Кастомний обробник для ротації логів
 class CustomTimedRotatingHandler(TimedRotatingFileHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.namer = self.rotate_namer
         self.rotator = self.rotate_rotator
-
+        
     def rotate_namer(self, default_name):
         base, ext = os.path.splitext(default_name)
         return base + ext
-
+        
     def rotate_rotator(self, source, dest):
         # Видалити всі файли логів, крім поточного та останнього резервного
         dir_name, file_name = os.path.split(source)
         files = [f for f in os.listdir(dir_name) if f.startswith(os.path.splitext(file_name)[0])]
         files.sort()
-
+        
         # Зберегти тільки 2 останні файли (поточний + 1 резервний)
         if len(files) > 2:
             for old_file in files[:-2]:
-                os.remove(os.path.join(dir_name, old_file))
-
+                try:
+                    os.remove(os.path.join(dir_name, old_file))
+                except OSError as e:
+                    logging.error(f"Помилка видалення старого логу: {e}")
+        
         os.rename(source, dest)
+
+# Налаштування ротації логів
+def setup_logging():
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # Видалити існуючі обробники
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    # Створити обробник з ротацією
+    handler = CustomTimedRotatingHandler(
+        LOG_FILE,
+        when='H',  # Ротація щогодини
+        interval=12,  # Кожні 12 годин
+        backupCount=1  # Зберігати 1 резервну копію (разом з поточним - 24 години логів)
+    )
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    ))
+    logger.addHandler(handler)
+    
+    return logger
+
+# Ініціалізація логування
+logger = setup_logging()
+logger.info("=== Бот запущено ===")
+
+
 # Глобальні змінні
 clients = {}
 notification_chats = {}
