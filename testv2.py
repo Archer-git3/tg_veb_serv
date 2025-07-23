@@ -10,9 +10,6 @@ import os
 import random
 import asyncio
 import pickle  # Для більш ефективного збереження даних
-from db import async_session,init_db
-from models import NotificationChat, TelegramAccount
-from sqlalchemy import select
 
 
 
@@ -22,7 +19,7 @@ API_HASH = "0fba92868b9d99d1e63583a8fb751fb4"
 ACCOUNTS_FILE = "telegram_accounts.json"
 
 # Глобальний цикл подій
-if not hasattr(st.session_state, 'loop') or st.session_state.loop.is_closed():
+if not hasattr(st.session_state, 'loop'):
     st.session_state.loop = asyncio.new_event_loop()
 asyncio.set_event_loop(st.session_state.loop)
 
@@ -55,11 +52,6 @@ def save_accounts_to_file():
     except Exception as e:
         st.error(f"Помилка збереження даних: {str(e)}")
 
-
-async def load_accounts_from_db():
-    async with async_session() as session:
-        result = await session.execute(select(TelegramAccount))
-        return result.scalars().all()
 
 def load_accounts_from_file():
     """Завантажує акаунти та групи з файлу, конвертує з JSON при необхідності"""
@@ -160,7 +152,7 @@ def load_accounts_from_file():
         return [], [], None
 
 
-async def init_session_state():
+def init_session_state():
     required_states = {
         'current_account': None,
         'login_stage': 'start',
@@ -172,28 +164,22 @@ async def init_session_state():
         'active_form': None,
         'editing_group': None,
         'group_to_delete': None,
-        'last_full_update': datetime.min,
-        'db_initialized': False  # Додано прапорець ініціалізації БД
+        'last_full_update': datetime.min
     }
 
     for key, default in required_states.items():
         if key not in st.session_state:
             st.session_state[key] = default
 
-    # Ініціалізація БД виконується лише один раз
-    if not st.session_state.db_initialized:
-        #await init_db()
-        st.session_state.db_initialized = True
-
-    # Завантаження акаунтів лише при першому запуску
+    # Завантажуємо акаунти тільки при першому запуску
     if 'accounts' not in st.session_state or 'groups' not in st.session_state:
-        accounts_raw = await load_accounts_from_db()
-        accounts = [a.to_dict() for a in accounts_raw]
-        groups = sorted({acc["group"] for acc in accounts})
+        accounts, groups, last_saved = load_accounts_from_file()
         st.session_state.accounts = accounts
         st.session_state.groups = groups
+        if last_saved:
+            st.session_state.last_saved = last_saved
 
-    # Ініціалізація полів акаунтів
+    # Переконуємось, що всі акаунти мають обов'язкові поля
     for account in st.session_state.accounts:
         account.setdefault('unread_count', 0)
         account.setdefault('oldest_unread', None)
@@ -768,8 +754,7 @@ def manage_groups_form():
 async def main_ui():
     """Головний інтерфейс програми"""
     st.title("📊 Моніторинг повідомлень Telegram")
-    #await init_db()
-    await init_session_state()
+    init_session_state()
 
     # Кнопки додавання нового акаунта та нової групи
     col1, col2 = st.columns(2)
@@ -792,22 +777,22 @@ async def main_ui():
     # Кнопка керування групами
     if st.button("👥 Керування групами", use_container_width=True, key="manage_groups_btn"):
         # Перемикаємо стан форми керування групами
-        if st.session_state.get("active_form") == 'manage_groups':
+        if st.session_state.active_form == 'manage_groups':
             st.session_state.active_form = None
         else:
             st.session_state.active_form = 'manage_groups'
         st.rerun()
 
     # Відображення активної форми
-    if st.session_state.get("active_form") == 'add_account':
+    if st.session_state.active_form == 'add_account':
         with st.expander("Додати новий акаунт", expanded=True):
             await login()
 
-    elif st.session_state.get("active_form") == 'add_group':
+    elif st.session_state.active_form == 'add_group':
         with st.expander("Створення нової групи", expanded=True):
             create_new_group_form()
 
-    elif st.session_state.get("active_form") == 'manage_groups':
+    elif st.session_state.active_form == 'manage_groups':
         with st.expander("Керування групами", expanded=True):
             manage_groups_form()
 
@@ -865,10 +850,11 @@ async def main_ui():
                     st.rerun()
 
 
-async def main_async():
-    await main_ui()
-
-    
 # Запуск додатка
-if __name__ == "__main__":
-    asyncio.run(main_async())
+if __name__ == '__main__':
+    # Перевірка чи цикл подій вже запущений
+    if not st.session_state.loop.is_running():
+        st.session_state.loop.run_until_complete(main_ui())
+    else:
+        # Якщо цикл вже запущений, просто додаємо задачу
+        asyncio.run_coroutine_threadsafe(main_ui(), st.session_state.loop)
