@@ -10,7 +10,7 @@ import os
 import random
 import asyncio
 import pickle  # Для більш ефективного збереження даних
-from db import async_session,init_db
+#from db import async_session,init_db
 from models import NotificationChat, TelegramAccount
 from sqlalchemy import select
 
@@ -768,7 +768,7 @@ def manage_groups_form():
 async def main_ui():
     """Головний інтерфейс програми"""
     st.title("📊 Моніторинг повідомлень Telegram")
-    await init_db()
+    #await init_db()
     await init_session_state()
 
     # Кнопки додавання нового акаунта та нової групи
