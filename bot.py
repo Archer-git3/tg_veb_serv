@@ -1,7 +1,7 @@
 import os
 import json
 import asyncio
-import logging
+
 from datetime import datetime
 from telethon import TelegramClient, events, errors, types
 from telethon.sessions import StringSession
@@ -67,6 +67,7 @@ class AccountClient:
             self.is_running = True
             return True
         except Exception as e:
+            logger.error(f"Помилка запуску клієнта {self.account_data['name']}: {e}")
             return False
 
     async def stop(self):
@@ -81,6 +82,7 @@ async def load_accounts():
     try:
         # Перевіряємо, чи файл існує
         if not os.path.exists(ACCOUNTS_FILE):
+            logger.warning("Файл акаунтів не знайдено")
             return False
 
         # Отримуємо час модифікації файлу
@@ -99,6 +101,7 @@ async def load_accounts():
         # Отримуємо акаунти з нової структури даних
         accounts = data.get("accounts", [])
         if not accounts:
+            logger.warning("Файл акаунтів не містить даних")
             return False
 
         # Зупиняємо старі клієнти
@@ -117,13 +120,16 @@ async def load_accounts():
             client = AccountClient(account)
             if await client.start():
                 clients[account['phone']] = client
+                logger.info(f"Акаунт {account['name']} успішно завантажено")
 
                 # Якщо акаунт є адміном, додаємо його user_id
                 if account.get('is_admin', False) and client.me:
                     admins.add(client.me.id)
+                    logger.info(f"Додано адміністратора: {client.me.id}")
 
         return True
     except Exception as e:
+        logger.error(f"Помилка завантаження акаунтів: {e}")
         return False
 
 
@@ -140,6 +146,7 @@ async def load_notification_chats():
                     if username:
                         settings['is_special'] = username.lower() in [u.lower() for u in SPECIAL_USERS]
     except Exception as e:
+        logger.error(f"Помилка завантаження чатів: {e}")
         notification_chats = {}
 
 
@@ -148,6 +155,7 @@ async def save_notification_chats():
         with open(NOTIFICATION_CHATS_FILE, 'wb') as f:
             pickle.dump(notification_chats, f)
     except Exception as e:
+        logger.error(f"Помилка збереження чатів: {e}")
 
 
 async def message_listener(client: AccountClient):
@@ -198,6 +206,7 @@ async def message_listener(client: AccountClient):
             }
             await message_queue.put(message_info)
         except Exception as e:
+            logger.error(f"Помилка обробки повідомлення: {e}")
 
 
 async def is_first_in_dialog(client, user_id):
@@ -213,6 +222,7 @@ async def is_first_in_dialog(client, user_id):
         # Якщо повідомлень менше 2, значить це перше повідомлення
         return len(messages) < 2
     except Exception as e:
+        logger.error(f"Помилка перевірки історії діалогу: {e}")
         return False
 
 
@@ -249,6 +259,7 @@ async def process_message_queue(bot: Bot):
                     parse_mode='Markdown'
                 )
             except Exception as e:
+                logger.error(f"Помилка відправки сповіщення: {e}")
         message_queue.task_done()
 
 
@@ -1059,6 +1070,7 @@ async def handle_unread_messages(query, context: ContextTypes.DEFAULT_TYPE):
                 })
 
         except Exception as e:
+            logger.error(f"Помилка перевірки акаунта {phone}: {e}")
             messages.append({
                 'account': client.account_data['name'],
                 'status': f"❌ Помилка: {str(e)[:100]}",
@@ -1211,6 +1223,7 @@ async def save_special_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
         await query.edit_message_text("✅ Зміни успішно збережено!")
     except Exception as e:
+        logger.error(f"Помилка збереження спеціальних акаунтів: {e}")
         await query.edit_message_text(f"❌ Помилка збереження: {str(e)}")
 
 
@@ -1227,12 +1240,14 @@ async def check_accounts_updates():
 
             # Оновлюємо акаунти, якщо файл змінився
             if await load_accounts():
+                logger.info("Оновлено акаунти з файлу")
 
                 # Перезапускаємо слухачі повідомлень
                 for client in clients.values():
                     if client.is_running:
                         asyncio.create_task(message_listener(client))
         except Exception as e:
+            logger.error(f"Помилка перевірки оновлень акаунтів: {e}")
 
 
 async def main():
