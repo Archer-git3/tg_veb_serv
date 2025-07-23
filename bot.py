@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import logging
+from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
 from telethon import TelegramClient, events, errors, types
 from telethon.sessions import StringSession
@@ -23,19 +24,57 @@ ACCOUNTS_CHECK_INTERVAL = 30
 # Список спеціальних користувачів (user_id)
 SPECIAL_USERS = ["fgtaaaqd", "іншийкористувач"]
 
-# Налаштування логування
-if os.path.exists(LOG_FILE):
-    os.remove(LOG_FILE)
 
-logging.basicConfig(
-    filename=LOG_FILE,
-    encoding='utf-8',
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-logger.info("=== Бот запущено ===")
+# Налаштування ротації логів
+def setup_logging():
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
 
+    # Видалити існуючі обробники
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+
+    # Створити кастомний обробник з ротацією
+    handler = CustomTimedRotatingHandler(
+        LOG_FILE,
+        when='H',
+        interval=12,
+        backupCount=1
+    )
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    ))
+    logger.addHandler(handler)
+
+    return logger
+
+# Викликати налаштування логування
+logger = setup_logging()
+
+
+# Додати цей клас для кастомної ротації
+class CustomTimedRotatingHandler(TimedRotatingFileHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.namer = self.rotate_namer
+        self.rotator = self.rotate_rotator
+
+    def rotate_namer(self, default_name):
+        base, ext = os.path.splitext(default_name)
+        return base + ext
+
+    def rotate_rotator(self, source, dest):
+        # Видалити всі файли логів, крім поточного та останнього резервного
+        dir_name, file_name = os.path.split(source)
+        files = [f for f in os.listdir(dir_name) if f.startswith(os.path.splitext(file_name)[0])]
+        files.sort()
+
+        # Зберегти тільки 2 останні файли (поточний + 1 резервний)
+        if len(files) > 2:
+            for old_file in files[:-2]:
+                os.remove(os.path.join(dir_name, old_file))
+
+        os.rename(source, dest)
 # Глобальні змінні
 clients = {}
 notification_chats = {}
@@ -1264,11 +1303,17 @@ async def check_accounts_updates():
 
 
 async def main():
+    global logger
+    logger = setup_logging()
+    logger.info("=== Бот запущено ===")
+
+    # Решта коду...
+
+    await load_notification_chats()
     # Ініціалізація бота
     application = Application.builder().token(BOT_TOKEN).build()
-
     # Завантаження даних
-    await load_notification_chats()
+
     await load_accounts()
 
     # Запуск обробників
