@@ -182,7 +182,7 @@ async def init_session_state():
 
     # Ініціалізація БД виконується лише один раз
     if not st.session_state.db_initialized:
-        await init_db()
+        #await init_db()
         st.session_state.db_initialized = True
 
     # Завантаження акаунтів лише при першому запуску
