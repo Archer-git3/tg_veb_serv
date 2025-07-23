@@ -10,7 +10,7 @@ import os
 import random
 import asyncio
 import pickle  # Для більш ефективного збереження даних
-#from db import async_session,init_db
+from db import async_session,init_db
 from models import NotificationChat, TelegramAccount
 from sqlalchemy import select
 
