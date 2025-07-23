@@ -865,9 +865,6 @@ async def main_ui():
 
 # Запуск додатка
 if __name__ == '__main__':
-    # Перевірка чи цикл подій вже запущений
-    if not st.session_state.loop.is_running():
-        st.session_state.loop.run_until_complete(main_ui())
-    else:
-        # Якщо цикл вже запущений, просто додаємо задачу
-        asyncio.run_coroutine_threadsafe(main_ui(), st.session_state.loop)
+    # Запускаємо асинхронно лише один раз
+    if 'main_task' not in st.session_state:
+        st.session_state.main_task = asyncio.create_task(main_ui())
