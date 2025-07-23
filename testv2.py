@@ -363,47 +363,50 @@ async def login():
 
 
 async def get_unread_stats_for_account(account):
-    """Оптимізоване отримання статистики для акаунта з використанням асинхронних ітераторів"""
+    """Ефективне отримання статистики для акаунта з використанням get_dialogs"""
     if account.get('skip_check', False):
         account['status'] = '⏭️ Пропущено'
         return
 
-    # Ініціалізація лічильника спроб
     account.setdefault('attempts', 0)
     MAX_ATTEMPTS = 2
 
+    client = None
     try:
         client = await create_client(account['session_string'])
 
         if not await client.is_user_authorized():
-            account['status'] = "Не авторизовано"
+            account['status'] = "Не аворизовано"
             return
 
         me = await client.get_me()
         unread_chats_count = 0
         oldest_unread_date = None
         
-        # Асинхронний ітератор для діалогів
-        dialogs = client.iter_dialogs(
+        # Використовуємо get_dialogs замість iter_dialogs для одноразового отримання всіх діалогів
+        dialogs = await client.get_dialogs(
             limit=None,  # Без обмеження кількості
             ignore_migrated=True,
             archived=False
         )
 
-        # Паралельна обробка діалогів
-        async for dialog in dialogs:
+        # Швидка обробка діалогів
+        for dialog in dialogs:
             entity = dialog.entity
             
-            # Швидка перевірка на валідність діалогу
+            # Перевірка на валідність сутності
             if not hasattr(entity, 'id') or entity.id == me.id:
                 continue
                 
-            # Перевірка типу сутності
-            is_valid_user = isinstance(entity, types.User) and not getattr(entity, 'bot', False)
-            is_valid_chat = isinstance(entity, (types.Chat, types.Channel)) and not getattr(entity, 'broadcast', False)
+            # Фільтрація за типом
+            is_user = isinstance(entity, types.User)
+            is_group = isinstance(entity, (types.Chat, types.Channel))
             
-            if not (is_valid_user or is_valid_chat):
-                continue
+            if is_user and getattr(entity, 'bot', False):
+                continue  # Пропускаємо ботів
+                
+            if is_group and getattr(entity, 'broadcast', False):
+                continue  # Пропускаємо канали-трансляції
 
             # Перевіряємо непрочитані повідомлення
             if dialog.unread_count > 0:
@@ -426,13 +429,17 @@ async def get_unread_stats_for_account(account):
             account['status'] = f"❗ FloodWait {fwe.seconds}s"
             return
 
-        wait_time = min(fwe.seconds + random.uniform(1, 3), 60)  # Обмежуємо очікування
+        wait_time = min(fwe.seconds + random.uniform(1, 3), 60)
         account['status'] = f"⏳ Чекаємо {wait_time:.1f}с"
         await asyncio.sleep(wait_time)
         await get_unread_stats_for_account(account)  # Рекурсивний повтор
 
     except Exception as e:
         account['status'] = f"⚠️ {str(e)[:20]}"
+        logger.error(f"Помилка для акаунта {account.get('phone', '')}: {str(e)}")
+    finally:
+        # Не закриваємо клієнта - залишаємо для кешу
+        pass
 
 
 async def update_all_accounts():
