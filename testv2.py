@@ -17,8 +17,7 @@ import pickle  # Для більш ефективного збереження �
 API_ID = 29148113
 API_HASH = "0fba92868b9d99d1e63583a8fb751fb4"
 ACCOUNTS_FILE = "telegram_accounts.json"
-# Додамо глобальний кеш клієнтів
-CLIENT_CACHE = {}
+
 # Глобальний цикл подій
 if not hasattr(st.session_state, 'loop'):
     st.session_state.loop = asyncio.new_event_loop()
@@ -191,36 +190,33 @@ def init_session_state():
         account.setdefault('client', None)
 
 
-
-
 async def create_client(session_string=None):
     """Створення нового клієнта Telegram з кешуванням"""
-    if not session_string:
-        # Створюємо тимчасового клієнта для нових сесій
-        client = TelegramClient(StringSession(), API_ID, API_HASH, loop=st.session_state.loop)
-        await client.connect()
-        return client
-
-    # Перевіряємо кеш
-    if session_string in CLIENT_CACHE:
-        cached_client = CLIENT_CACHE[session_string]
-        try:
-            if await cached_client.is_connected():
-                return cached_client
-        except:
-            pass
+    # Перевіряємо чи вже маємо активного клієнта
+    if session_string:
+        for account in st.session_state.accounts:
+            if account.get('session_string') == session_string and account.get('client'):
+                try:
+                    if await account['client'].is_connected():
+                        return account['client']
+                except:
+                    pass
 
     # Створюємо нового клієнта
-    client = TelegramClient(StringSession(session_string), API_ID, API_HASH, loop=st.session_state.loop)
+    client = TelegramClient(
+        StringSession(session_string) if session_string else StringSession(),
+        API_ID,
+        API_HASH,
+        loop=st.session_state.loop
+    )
+    client.flood_sleep_threshold = 0
     await client.connect()
 
-    # Кешуємо клієнт
-    CLIENT_CACHE[session_string] = client
-    
-    # Оновлюємо клієнта в акаунтах
-    for account in st.session_state.accounts:
-        if account.get('session_string') == session_string:
-            account['client'] = client
+    # Кешуємо клієнт для майбутнього використання
+    if session_string:
+        for account in st.session_state.accounts:
+            if account.get('session_string') == session_string:
+                account['client'] = client
 
     return client
 
@@ -363,12 +359,16 @@ async def login():
 
 
 async def get_unread_stats_for_account(account):
-    """Ефективне отримання статистики для акаунта з використанням get_dialogs"""
+    """Оптимізоване отримання статистики для акаунта"""
     if account.get('skip_check', False):
         account['status'] = '⏭️ Пропущено'
         return
 
-    account.setdefault('attempts', 0)
+    # Ініціалізація лічильника спроб
+    if 'attempts' not in account:
+        account['attempts'] = 0
+
+    # Максимальна кількість спроб
     MAX_ATTEMPTS = 2
 
     client = None
@@ -376,42 +376,34 @@ async def get_unread_stats_for_account(account):
         client = await create_client(account['session_string'])
 
         if not await client.is_user_authorized():
-            account['status'] = "Не аворизовано"
+            account['status'] = "Не авторизовано"
             return
 
         me = await client.get_me()
         unread_chats_count = 0
         oldest_unread_date = None
-        
-        # Використовуємо get_dialogs замість iter_dialogs для одноразового отримання всіх діалогів
+
+        # Отримуємо тільки необхідні діалоги з обмеженням
         dialogs = await client.get_dialogs(
-            limit=None,  # Без обмеження кількості
+            limit=400,  # Зменшена кількість для прискорення
             ignore_migrated=True,
             archived=False
         )
 
-        # Швидка обробка діалогів
+        # Швидка фільтрація діалогів
         for dialog in dialogs:
-            entity = dialog.entity
-            
-            # Перевірка на валідність сутності
-            if not hasattr(entity, 'id') or entity.id == me.id:
+            # Швидка перевірка типу
+            if not hasattr(dialog.entity, 'id') or dialog.entity.id == me.id:
                 continue
-                
-            # Фільтрація за типом
-            is_user = isinstance(entity, types.User)
-            is_group = isinstance(entity, (types.Chat, types.Channel))
-            
-            if is_user and getattr(entity, 'bot', False):
-                continue  # Пропускаємо ботів
-                
-            if is_group and getattr(entity, 'broadcast', False):
-                continue  # Пропускаємо канали-трансляції
+
+            # Пропускаємо ботів і не-користувачів
+            if getattr(dialog.entity, 'bot', False) or not isinstance(dialog.entity, types.User):
+                continue
 
             # Перевіряємо непрочитані повідомлення
             if dialog.unread_count > 0:
                 unread_chats_count += 1
-                
+
                 # Оновлюємо найстаріше повідомлення
                 if oldest_unread_date is None or dialog.message.date < oldest_unread_date:
                     oldest_unread_date = dialog.message.date
@@ -429,18 +421,16 @@ async def get_unread_stats_for_account(account):
             account['status'] = f"❗ FloodWait {fwe.seconds}s"
             return
 
-        wait_time = min(fwe.seconds + random.uniform(1, 3), 60)
+        wait_time = min(fwe.seconds + random.uniform(2, 5), 120)  # Обмежуємо очікування
         account['status'] = f"⏳ Чекаємо {wait_time:.1f}с"
         await asyncio.sleep(wait_time)
         await get_unread_stats_for_account(account)  # Рекурсивний повтор
 
     except Exception as e:
         account['status'] = f"⚠️ {str(e)[:20]}"
-        logger.error(f"Помилка для акаунта {account.get('phone', '')}: {str(e)}")
     finally:
         # Не закриваємо клієнта - залишаємо для кешу
         pass
-
 
 async def update_all_accounts():
     """Паралельне оновлення акаунтів з обмеженням потоків"""
@@ -469,16 +459,14 @@ async def update_all_accounts():
         status_text.text(f"Оновлено {progress_counter}/{len(accounts_to_update)} акаунтів")
 
     # Використовуємо семафор для обмеження паралельних запитів
-    MAX_CONCURRENT = 5  # Збільшимо кількість паралельних запитів
+    MAX_CONCURRENT = 4
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
     async def safe_update(account):
         async with semaphore:
-            try:
-                await get_unread_stats_for_account(account)
-            finally:
-                update_progress()
-                await asyncio.sleep(0.5)  # Невелика пауза між акаунтами
+            await get_unread_stats_for_account(account)
+            update_progress()
+            await asyncio.sleep(random.uniform(1, 3))  # Невелика пауза
 
     # Створюємо та виконуємо задачі
     tasks = [safe_update(account) for account in accounts_to_update]
