@@ -386,8 +386,6 @@ async def get_unread_stats_for_account(account):
         # Отримуємо тільки необхідні діалоги з обмеженням
         dialogs = await client.get_dialogs(
             limit=600,  # Зменшена кількість для прискорення
-            ignore_migrated=True,
-            archived=False
         )
 
         # Швидка фільтрація діалогів
