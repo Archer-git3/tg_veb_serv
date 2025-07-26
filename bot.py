@@ -25,25 +25,23 @@ ACCOUNTS_CHECK_INTERVAL = 30
 SPECIAL_USERS = ["fgtaaaqd", "іншийкористувач"]
 
 
-
-
 # Кастомний обробник для ротації логів
 class CustomTimedRotatingHandler(TimedRotatingFileHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.namer = self.rotate_namer
         self.rotator = self.rotate_rotator
-        
+
     def rotate_namer(self, default_name):
         base, ext = os.path.splitext(default_name)
         return base + ext
-        
+
     def rotate_rotator(self, source, dest):
         # Видалити всі файли логів, крім поточного та останнього резервного
         dir_name, file_name = os.path.split(source)
         files = [f for f in os.listdir(dir_name) if f.startswith(os.path.splitext(file_name)[0])]
         files.sort()
-        
+
         # Зберегти тільки 2 останні файли (поточний + 1 резервний)
         if len(files) > 2:
             for old_file in files[:-2]:
@@ -51,18 +49,19 @@ class CustomTimedRotatingHandler(TimedRotatingFileHandler):
                     os.remove(os.path.join(dir_name, old_file))
                 except OSError as e:
                     logging.error(f"Помилка видалення старого логу: {e}")
-        
+
         os.rename(source, dest)
+
 
 # Налаштування ротації логів
 def setup_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    
+
     # Видалити існуючі обробники
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
-    
+
     # Створити обробник з ротацією
     handler = CustomTimedRotatingHandler(
         LOG_FILE,
@@ -74,13 +73,13 @@ def setup_logging():
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     ))
     logger.addHandler(handler)
-    
+
     return logger
+
 
 # Ініціалізація логування
 logger = setup_logging()
 logger.info("=== Бот запущено ===")
-
 
 # Глобальні змінні
 clients = {}
@@ -134,30 +133,24 @@ class AccountClient:
             await self.client.disconnect()
         self.is_running = False
 
-
+# Додаємо перевірку skip_check у функцію завантаження акаунтів
 async def load_accounts():
     global last_accounts_mtime, admins
 
     try:
-        # Перевіряємо, чи файл існує
         if not os.path.exists(ACCOUNTS_FILE):
             logger.warning("Файл акаунтів не знайдено")
             return False
 
-        # Отримуємо час модифікації файлу
         current_mtime = os.path.getmtime(ACCOUNTS_FILE)
-
-        # Перевіряємо, чи файл змінився
         if current_mtime <= last_accounts_mtime:
             return False
 
         last_accounts_mtime = current_mtime
 
-        # Читаємо бінарний файл за допомогою pickle
         with open(ACCOUNTS_FILE, 'rb') as f:
             data = pickle.load(f)
 
-        # Отримуємо акаунти з нової структури даних
         accounts = data.get("accounts", [])
         if not accounts:
             logger.warning("Файл акаунтів не містить даних")
@@ -167,13 +160,12 @@ async def load_accounts():
         for client in list(clients.values()):
             await client.stop()
         clients.clear()
-
-        # Очищаємо адмінів
         admins.clear()
 
-        # Завантажуємо нові акаунти
         for account in accounts:
+            # Пропускаємо акаунти з skip_check = True
             if account.get('skip_check', False):
+                logger.info(f"Пропущено акаунт {account['name']} (skip_check=True)")
                 continue
 
             client = AccountClient(account)
@@ -181,7 +173,6 @@ async def load_accounts():
                 clients[account['phone']] = client
                 logger.info(f"Акаунт {account['name']} успішно завантажено")
 
-                # Якщо акаунт є адміном, додаємо його user_id
                 if account.get('is_admin', False) and client.me:
                     admins.add(client.me.id)
                     logger.info(f"Додано адміністратора: {client.me.id}")
@@ -191,6 +182,43 @@ async def load_accounts():
         logger.error(f"Помилка завантаження акаунтів: {e}")
         return False
 
+async def send_notification(bot: Bot, chat_id: int, message: dict):
+    try:
+        # Додаємо інформацію про перше повідомлення
+        first_msg_info = "🌟 **Перше повідомлення!**\n" if message['is_first'] else ""
+
+        # Додаємо індикатор спеціального акаунта
+        special_indicator = "⭐ СПЕЦІАЛЬНИЙ АКАУНТ ⭐\n" if message.get('is_special', False) else ""
+
+        text = (
+            f"🔔 **Нове повідомлення!**\n"
+            f"{special_indicator}"
+            f"{first_msg_info}"
+            f"👤 Акаунт: `{message['account']}`\n"
+            f"👤 Відправник: `{message['sender']}`\n"
+            f"📅 Дата: `{message['date']}`\n"
+            f"🏷️ Група: `{message['group']}`\n"
+            f"\n{message['text']}"
+        )
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Помилка відправки сповіщення: {e}")
+
+
+
+# Функція для отримання адмінів групи
+def get_group_admins(group_name):
+    admins_list = []
+    for client in clients.values():
+        if (client.account_data.get('group') == group_name and
+            client.account_data.get('is_admin', False) and
+            client.me):
+            admins_list.append(client.me.id)
+    return admins_list
 
 async def load_notification_chats():
     global notification_chats
@@ -221,30 +249,27 @@ async def message_listener(client: AccountClient):
     @client.client.on(events.NewMessage(incoming=True))
     async def handler(event):
         try:
-            # Ігноруємо власні повідомлення
             if event.message.sender_id == client.me.id:
                 return
 
-            # Ігноруємо повідомлення від ботів
+            # Перевіряємо чи акаунт має skip_check
+            if client.account_data.get('skip_check', False):
+                return
             sender = await event.get_sender()
             if isinstance(sender, types.User) and sender.bot:
                 return
 
-            # Перевіряємо, що це повідомлення від користувача
             if not isinstance(event.message.peer_id, types.PeerUser):
                 return
 
-            # Отримуємо ім'я користувача
             sender_name = "Невідомий"
             if sender:
                 sender_name = sender.username or f"{sender.first_name or ''} {sender.last_name or ''}".strip()
                 if not sender_name:
                     sender_name = f"user_{sender.id}"
 
-            # Перевіряємо, чи це перше повідомлення в діалозі
             is_first_message = await is_first_in_dialog(client, event.message.peer_id.user_id)
 
-            # Обробляємо текст повідомлення
             message_text = ""
             if event.message.text:
                 message_text = event.message.text[:1000] + '...' if len(
@@ -264,6 +289,27 @@ async def message_listener(client: AccountClient):
                 'is_special': client.is_special
             }
             await message_queue.put(message_info)
+
+            # Додатково: негайне сповіщення адмінів групи
+            if not client.is_special:
+                group_admins = get_group_admins(client.account_data['group'])
+                if group_admins:
+                    text = (
+                        f"🔔 **Нове повідомлення у вашій групі!**\n"
+                        f"👤 Акаунт: `{client.account_data['name']}`\n"
+                        f"👤 Відправник: `{sender_name}`\n"
+                        f"\n{message_text}"
+                    )
+
+                    for admin_id in group_admins:
+                        try:
+                            # Тут потрібен спосіб відправки повідомлень адмінам
+                            # Наприклад, через бота або безпосередньо клієнтом
+                            # Це залежить від вашої архітектури
+                            pass
+                        except Exception as e:
+                            logger.error(f"Помилка відправки сповіщення адміну: {e}")
+
         except Exception as e:
             logger.error(f"Помилка обробки повідомлення: {e}")
 
@@ -288,50 +334,60 @@ async def is_first_in_dialog(client, user_id):
 async def process_message_queue(bot: Bot):
     while True:
         message = await message_queue.get()
+        sent_to_admins = set()  # Щоб уникнути дублювання сповіщень
+
+        # Знаходимо всіх адмінів, яким потрібно відправити сповіщення
         for chat_id_str, settings in notification_chats.items():
             try:
-                # Для спеціальних акаунтів - ігноруємо перевірку груп
-                #if not message.get('is_special', False):
-                # Для звичайних акаунтів - перевіряємо групи
-                if 'groups' not in settings or message['group'] not in settings['groups']:
+                chat_id = int(chat_id_str)
+
+                # Перевіряємо чи це адмін або спеціальний користувач
+                user_id = settings['user_id']
+                if not (is_admin(user_id) or settings.get('is_special', False)):
                     continue
 
-                # Додаємо інформацію про перше повідомлення
-                first_msg_info = "🌟 **Перше повідомлення!**\n" if message['is_first'] else ""
+                # Для спеціальних акаунтів - відправляємо всім спеціальним користувачам
+                if message.get('is_special', False):
+                    if settings.get('is_special', False):
+                        await send_notification(bot, chat_id, message)
+                        sent_to_admins.add(chat_id)
 
-                # Додаємо індикатор спеціального акаунта
-                special_indicator = "⭐ СПЕЦІАЛЬНИЙ АКАУНТ ⭐\n" if message.get('is_special', False) else ""
+                # Для звичайних акаунтів - перевіряємо групи
+                else:
+                    if 'groups' in settings and message['group'] in settings['groups']:
+                        await send_notification(bot, chat_id, message)
+                        sent_to_admins.add(chat_id)
 
-                text = (
-                    f"🔔 **Нове повідомлення!**\n"
-                    f"{special_indicator}"
-                    f"{first_msg_info}"
-                    f"👤 Акаунт: `{message['account']}`\n"
-                    f"👤 Відправник: `{message['sender']}`\n"
-                    f"📅 Дата: `{message['date']}`\n"
-                    f"🏷️ Група: `{message['group']}`\n"
-                    f"\n{message['text']}"
-                )
-                await bot.send_message(
-                    chat_id=int(chat_id_str),
-                    text=text,
-                    parse_mode='Markdown'
-                )
             except Exception as e:
-                logger.error(f"Помилка відправки сповіщення: {e}")
-        message_queue.task_done()
+                logger.error(f"Помилка перевірки чату: {e}")
 
+        # Додатково: відправляємо сповіщення адмінам групи
+        if not message.get('is_special', False):
+            group_admins = get_group_admins(message['group'])
+            for admin_id in group_admins:
+                if admin_id not in sent_to_admins:
+                    try:
+                        # Шукаємо chat_id для цього адміна
+                        for cid, sett in notification_chats.items():
+                            if sett['user_id'] == admin_id:
+                                await send_notification(bot, int(cid), message)
+                                break
+                    except Exception as e:
+                        logger.error(f"Помилка відправки сповіщення адміну: {e}")
+
+        message_queue.task_done()
 
 def is_admin(user_id):
     """Перевіряє, чи є користувач адміністратором"""
     return user_id in admins
+
 
 def has_admin_rights(user_id):
     """Перевіряє, чи користувач має права адміністратора"""
     return user_id in admins or user_id in SPECIAL_USERS
 
 
-async def group_selection_required( update: Update, context: ContextTypes.DEFAULT_TYPE, handler):
+async def group_selection_required(update: Update, context: ContextTypes.DEFAULT_TYPE, handler):
     """Декоратор для перевірки прав на вибір груп"""
     user_id = update.effective_user.id
     query = update.callback_query
@@ -342,9 +398,9 @@ async def group_selection_required( update: Update, context: ContextTypes.DEFAUL
     is_special = username and username.lower() in [u.lower() for u in SPECIAL_USERS]
     # Тільки спеціальні користувачі можуть вибирати групи
 
-
     # Викликаємо обробник
     return await handler(update, context)
+
 
 async def admin_required(update: Update, context: ContextTypes.DEFAULT_TYPE, handler):
     """Декоратор для перевірки прав адміністратора"""
@@ -531,8 +587,15 @@ async def reset_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.edit_message_text("🧹 Всі групи скинуті! Ви не отримуватимете сповіщень.")
 
+
+def get_admin_group(user_id):
+    for client in clients.values():
+        if client.me and client.me.id == user_id:
+            return client.account_data.get('group', '')
+    return None
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Визначаємо тип виклику (повідомлення чи callback)
     if update.callback_query:
         query = update.callback_query
         await query.answer()
@@ -548,7 +611,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id_str = str(chat_id)
     is_special = username and username.lower() in [u.lower() for u in SPECIAL_USERS]
 
-    # Ініціалізація чату
+    # Перевіряємо чи є користувач адміном або спеціальним
+    if not (is_admin(user_id) or is_special):
+        text = "❌ Ви не маєте доступу до цього бота. Зверніться до адміністратора."
+        if update.callback_query:
+            await query.edit_message_text(text)
+        else:
+            await message.reply_text(text)
+        return
+
+    # Ініціалізація чату тільки для адмінів та спеціальних користувачів
     if chat_id_str not in notification_chats:
         notification_chats[chat_id_str] = {
             'user_id': user_id,
@@ -556,13 +628,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'groups': [],
             'is_special': is_special
         }
+
+        # Автоматично додаємо групу для звичайних адмінів
+        if not is_special and is_admin(user_id):
+            admin_group = get_admin_group(user_id)
+            if admin_group:
+                notification_chats[chat_id_str]['groups'] = [admin_group]
+                await save_notification_chats()
+                logger.info(f"Автоматично додано групу {admin_group} для адміна {user_id}")
     else:
         # Оновлюємо дані користувача
         notification_chats[chat_id_str]['user_id'] = user_id
         notification_chats[chat_id_str]['username'] = username
         notification_chats[chat_id_str]['is_special'] = is_special
 
-    await save_notification_chats()
+    # Якщо це звичайний адмін без груп - додаємо його групу
+    settings = notification_chats[chat_id_str]
+    if not settings['is_special'] and is_admin(user_id) and not settings.get('groups'):
+        admin_group = get_admin_group(user_id)
+        if admin_group:
+            settings['groups'] = [admin_group]
+            await save_notification_chats()
+            logger.info(f"Додано групу {admin_group} для адміна {user_id}")
 
     # Визначаємо статус користувача
     if is_special:
@@ -787,7 +874,7 @@ async def _my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response, parse_mode='Markdown')
 
 
-#async def toggle_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# async def toggle_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #    query = update.callback_query
 #    await query.answer()
 #
@@ -843,8 +930,6 @@ async def _toggle_group_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await update_group_buttons(query)
 
 
-
-
 async def _save_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -860,9 +945,6 @@ async def _save_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         f"✅ Вибрано груп: {selected_count}\n\n"
         "Тепер ви будете отримувати сповіщення лише для обраних груп."
     )
-
-
-
 
 
 async def _reset_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -896,7 +978,6 @@ async def update_group_buttons(query):
     # Для звичайних адміністраторів показуємо тільки неспеціальні групи
     if user_id not in SPECIAL_USERS:
         all_groups = all_groups - special_groups
-
 
     # Створюємо нову клавіатуру з оновленими станами
     keyboard = []
@@ -997,6 +1078,7 @@ async def _check_unread(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(message_text, reply_markup=reply_markup)
     else:
         await message.reply_text(message_text, reply_markup=reply_markup)
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1284,8 +1366,6 @@ async def save_special_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         logger.error(f"Помилка збереження спеціальних акаунтів: {e}")
         await query.edit_message_text(f"❌ Помилка збереження: {str(e)}")
-
-
 
 
 async def check_accounts_updates():
