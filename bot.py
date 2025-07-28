@@ -1,1473 +1,731 @@
-import json
-import asyncio
-import logging
-from logging.handlers import TimedRotatingFileHandler
-import os
-from datetime import datetime
-from telethon import TelegramClient, events, errors, types
+from telethon import TelegramClient, types
 from telethon.sessions import StringSession
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
+from datetime import datetime, timezone
+import streamlit as st
+import pandas as pd
 import time
-import pickle  # Додано для роботи з бінарними файлами
+import json
+import os
+import random
+import asyncio
+import pickle
 
 # Конфігурація
 API_ID = 29148113
 API_HASH = "0fba92868b9d99d1e63583a8fb751fb4"
-BOT_TOKEN = "7603687034:AAG9102_4yFSuHrwE17FgO-Fc8nnfL1Z4-8"
-ACCOUNTS_FILE = "telegram_accounts.json"  # Змінимо розширення на pkl
-NOTIFICATION_CHATS_FILE = "notification_chats.json"  # Змінимо розширення на pkl
-LOG_FILE = "bot.log"
-SESSION_TIMEOUT = 60
-ACCOUNTS_CHECK_INTERVAL = 30
+ACCOUNTS_FILE = "telegram_accounts.json"
 
-# Список спеціальних користувачів (user_id)
-SPECIAL_USERS = ["fgtaaaqd", "іншийкористувач"]
+# Глобальний цикл подій
+if not hasattr(st.session_state, 'loop'):
+    st.session_state.loop = asyncio.new_event_loop()
+asyncio.set_event_loop(st.session_state.loop)
 
-
-# Кастомний обробник для ротації логів
-class CustomTimedRotatingHandler(TimedRotatingFileHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.namer = self.rotate_namer
-        self.rotator = self.rotate_rotator
-
-    def rotate_namer(self, default_name):
-        base, ext = os.path.splitext(default_name)
-        return base + ext
-
-    def rotate_rotator(self, source, dest):
-        # Видалити всі файли логів, крім поточного та останнього резервного
-        dir_name, file_name = os.path.split(source)
-        files = [f for f in os.listdir(dir_name) if f.startswith(os.path.splitext(file_name)[0])]
-        files.sort()
-
-        # Зберегти тільки 2 останні файли (поточний + 1 резервний)
-        if len(files) > 2:
-            for old_file in files[:-2]:
-                try:
-                    os.remove(os.path.join(dir_name, old_file))
-                except OSError as e:
-                    logging.error(f"Помилка видалення старого логу: {e}")
-
-        os.rename(source, dest)
-
-
-# Налаштування ротації логів
-def setup_logging():
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-
-    # Видалити існуючі обробники
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-
-    # Створити обробник з ротацією
-    handler = CustomTimedRotatingHandler(
-        LOG_FILE,
-        when='H',  # Ротація щогодини
-        interval=12,  # Кожні 12 годин
-        backupCount=1  # Зберігати 1 резервну копію (разом з поточним - 24 години логів)
-    )
-    handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    ))
-    logger.addHandler(handler)
-
-    return logger
-
-
-# Ініціалізація логування
-logger = setup_logging()
-logger.info("=== Бот запущено ===")
-
-# Глобальні змінні
-clients = {}
-notification_chats = {}
-admins = set()
-message_queue = asyncio.Queue()
-last_accounts_check = 0
-last_accounts_mtime = 0
-
-
-class AccountClient:
-    def __init__(self, account_data):
-        self.account_data = account_data
-        self.client = None
-        self.is_running = False
-        self.me = None
-        self.is_special = account_data.get('is_special', False)
-        self.last_updated = account_data.get('last_updated')
-        if isinstance(self.last_updated, str):
-            try:
-                self.last_updated = datetime.fromisoformat(self.last_updated)
-            except ValueError:
-                self.last_updated = datetime.now()
-
-    async def start(self):
-        if self.client and self.client.is_connected():
-            return True
-
-        try:
-            self.client = TelegramClient(
-                StringSession(self.account_data['session_string']),
-                API_ID,
-                API_HASH,
-                timeout=SESSION_TIMEOUT
-            )
-            await self.client.connect()
-
-            if not await self.client.is_user_authorized():
-                logger.error(f"Клієнт {self.account_data['name']} не авторизований!")
-                return False
-
-            self.me = await self.client.get_me()
-            self.is_running = True
-            return True
-        except Exception as e:
-            logger.error(f"Помилка запуску клієнта {self.account_data['name']}: {e}")
-            return False
-
-    async def stop(self):
-        if self.client and self.client.is_connected():
-            await self.client.disconnect()
-        self.is_running = False
-
-# Додаємо перевірку skip_check у функцію завантаження акаунтів
-async def load_accounts():
-    global last_accounts_mtime, admins
-
+def save_accounts_to_file():
     try:
-        if not os.path.exists(ACCOUNTS_FILE):
-            logger.warning("Файл акаунтів не знайдено")
-            return False
-
-        current_mtime = os.path.getmtime(ACCOUNTS_FILE)
-        if current_mtime <= last_accounts_mtime:
-            return False
-
-        last_accounts_mtime = current_mtime
-
-        with open(ACCOUNTS_FILE, 'rb') as f:
-            data = pickle.load(f)
-
-        accounts = data.get("accounts", [])
-        if not accounts:
-            logger.warning("Файл акаунтів не містить даних")
-            return False
-
-        # Зупиняємо старі клієнти
-        for client in list(clients.values()):
-            await client.stop()
-        clients.clear()
-        admins.clear()
-
-        for account in accounts:
-            # Пропускаємо акаунти з skip_check = True
-            if account.get('skip_check', False):
-                logger.info(f"Пропущено акаунт {account['name']} (skip_check=True)")
-                continue
-
-            client = AccountClient(account)
-            if await client.start():
-                clients[account['phone']] = client
-                logger.info(f"Акаунт {account['name']} успішно завантажено")
-
-                if account.get('is_admin', False) and client.me:
-                    admins.add(client.me.id)
-                    logger.info(f"Додано адміністратора: {client.me.id}")
-
-        return True
-    except Exception as e:
-        logger.error(f"Помилка завантаження акаунтів: {e}")
-        return False
-
-async def send_notification(bot: Bot, chat_id: int, message: dict):
-    try:
-        # Додаємо інформацію про перше повідомлення
-        first_msg_info = "🌟 **Перше повідомлення!**\n" if message['is_first'] else ""
-
-        # Додаємо індикатор спеціального акаунта
-        special_indicator = "⭐ СПЕЦІАЛЬНИЙ АКАУНТ ⭐\n" if message.get('is_special', False) else ""
-
-        text = (
-            f"🔔 **Нове повідомлення!**\n"
-            f"{special_indicator}"
-            f"{first_msg_info}"
-            f"👤 Акаунт: `{message['account']}`\n"
-            f"👤 Відправник: `{message['sender']}`\n"
-            f"📅 Дата: `{message['date']}`\n"
-            f"🏷️ Група: `{message['group']}`\n"
-            f"\n{message['text']}"
-        )
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.error(f"Помилка відправки сповіщення: {e}")
-
-
-
-# Функція для отримання адмінів групи
-def get_group_admins(group_name):
-    admins_list = []
-    for client in clients.values():
-        if (client.account_data.get('group') == group_name and
-            client.account_data.get('is_admin', False) and
-            client.me):
-            admins_list.append(client.me.id)
-    return admins_list
-
-async def load_notification_chats():
-    global notification_chats
-    try:
-        if os.path.exists(NOTIFICATION_CHATS_FILE):
-            with open(NOTIFICATION_CHATS_FILE, 'rb') as f:
-                notification_chats = pickle.load(f)
-
-                # Оновлюємо статус спеціальних користувачів
-                for chat_id, settings in notification_chats.items():
-                    username = settings.get('username')
-                    if username:
-                        settings['is_special'] = username.lower() in [u.lower() for u in SPECIAL_USERS]
-    except Exception as e:
-        logger.error(f"Помилка завантаження чатів: {e}")
-        notification_chats = {}
-
-
-async def save_notification_chats():
-    try:
-        with open(NOTIFICATION_CHATS_FILE, 'wb') as f:
-            pickle.dump(notification_chats, f)
-    except Exception as e:
-        logger.error(f"Помилка збереження чатів: {e}")
-
-
-async def message_listener(client: AccountClient):
-    @client.client.on(events.NewMessage(incoming=True))
-    async def handler(event):
-        try:
-            if event.message.sender_id == client.me.id:
-                return
-
-            # Перевіряємо чи акаунт має skip_check
-            if client.account_data.get('skip_check', False):
-                return
-            sender = await event.get_sender()
-            if isinstance(sender, types.User) and sender.bot:
-                return
-
-            if not isinstance(event.message.peer_id, types.PeerUser):
-                return
-
-            sender_name = "Невідомий"
-            if sender:
-                sender_name = sender.username or f"{sender.first_name or ''} {sender.last_name or ''}".strip()
-                if not sender_name:
-                    sender_name = f"user_{sender.id}"
-
-            is_first_message = await is_first_in_dialog(client, event.message.peer_id.user_id)
-
-            message_text = ""
-            if event.message.text:
-                message_text = event.message.text[:1000] + '...' if len(
-                    event.message.text) > 1000 else event.message.text
-            elif event.message.media:
-                message_text = "📷 Медіа-повідомлення"
-
-            message_info = {
-                'account': client.account_data['name'],
-                'sender': sender_name,
-                'text': message_text,
-                'date': event.message.date.isoformat(),
-                'phone': client.account_data['phone'],
-                'group': client.account_data['group'],
-                'sender_id': sender.id if sender else 0,
-                'is_first': is_first_message,
-                'is_special': client.is_special
-            }
-            await message_queue.put(message_info)
-
-            # Додатково: негайне сповіщення адмінів групи
-            if not client.is_special:
-                group_admins = get_group_admins(client.account_data['group'])
-                if group_admins:
-                    text = (
-                        f"🔔 **Нове повідомлення у вашій групі!**\n"
-                        f"👤 Акаунт: `{client.account_data['name']}`\n"
-                        f"👤 Відправник: `{sender_name}`\n"
-                        f"\n{message_text}"
-                    )
-
-                    for admin_id in group_admins:
-                        try:
-                            # Тут потрібен спосіб відправки повідомлень адмінам
-                            # Наприклад, через бота або безпосередньо клієнтом
-                            # Це залежить від вашої архітектури
-                            pass
-                        except Exception as e:
-                            logger.error(f"Помилка відправки сповіщення адміну: {e}")
-
-        except Exception as e:
-            logger.error(f"Помилка обробки повідомлення: {e}")
-
-
-async def is_first_in_dialog(client, user_id):
-    """Перевіряє, чи є повідомлення першим у діалозі"""
-    try:
-        # Отримуємо історію діалогу
-        messages = await client.client.get_messages(
-            user_id,
-            limit=4,  # Беремо 2 повідомлення, щоб перевірити чи є попередні
-            reverse=True
-        )
-
-        # Якщо повідомлень менше 2, значить це перше повідомлення
-        return len(messages) < 2
-    except Exception as e:
-        logger.error(f"Помилка перевірки історії діалогу: {e}")
-        return False
-
-
-async def process_message_queue(bot: Bot):
-    while True:
-        message = await message_queue.get()
-        sent_to_admins = set()  # Щоб уникнути дублювання сповіщень
-
-        # Знаходимо всіх адмінів, яким потрібно відправити сповіщення
-        for chat_id_str, settings in notification_chats.items():
-            try:
-                chat_id = int(chat_id_str)
-
-                # Перевіряємо чи це адмін або спеціальний користувач
-                user_id = settings['user_id']
-                if not (is_admin(user_id) or settings.get('is_special', False)):
-                    continue
-
-                # Для спеціальних акаунтів - відправляємо всім спеціальним користувачам
-                if message.get('is_special', False):
-                    if settings.get('is_special', False):
-                        await send_notification(bot, chat_id, message)
-                        sent_to_admins.add(chat_id)
-
-                # Для звичайних акаунтів - перевіряємо групи
-                else:
-                    if 'groups' in settings and message['group'] in settings['groups']:
-                        await send_notification(bot, chat_id, message)
-                        sent_to_admins.add(chat_id)
-
-            except Exception as e:
-                logger.error(f"Помилка перевірки чату: {e}")
-
-        # Додатково: відправляємо сповіщення адмінам групи
-        if not message.get('is_special', False):
-            group_admins = get_group_admins(message['group'])
-            for admin_id in group_admins:
-                if admin_id not in sent_to_admins:
-                    try:
-                        # Шукаємо chat_id для цього адміна
-                        for cid, sett in notification_chats.items():
-                            if sett['user_id'] == admin_id:
-                                await send_notification(bot, int(cid), message)
-                                break
-                    except Exception as e:
-                        logger.error(f"Помилка відправки сповіщення адміну: {e}")
-
-        message_queue.task_done()
-
-def is_admin(user_id):
-    """Перевіряє, чи є користувач адміністратором"""
-    return user_id in admins
-
-
-def has_admin_rights(user_id):
-    """Перевіряє, чи користувач має права адміністратора"""
-    return user_id in admins or user_id in SPECIAL_USERS
-
-
-async def group_selection_required(update: Update, context: ContextTypes.DEFAULT_TYPE, handler):
-    """Декоратор для перевірки прав на вибір груп"""
-    user_id = update.effective_user.id
-    query = update.callback_query
-    chat_id = query.message.chat_id
-    chat_id_str = str(chat_id)
-    settings = notification_chats.get(chat_id_str, {})
-    username = settings.get('username')
-    is_special = username and username.lower() in [u.lower() for u in SPECIAL_USERS]
-    # Тільки спеціальні користувачі можуть вибирати групи
-
-    # Викликаємо обробник
-    return await handler(update, context)
-
-
-async def admin_required(update: Update, context: ContextTypes.DEFAULT_TYPE, handler):
-    """Декоратор для перевірки прав адміністратора"""
-    user_id = update.effective_user.id
-
-    # Базова перевірка на адміністратора
-    if not is_admin(user_id) and user_id not in SPECIAL_USERS:
-        if update.callback_query:
-            await update.callback_query.answer("❌ Ви не маєте прав адміністратора!", show_alert=True)
-        elif update.message:
-            await update.message.reply_text("❌ Ви не маєте прав адміністратора!")
-        return None
-
-    # Викликаємо обробник
-    return await handler(update, context)
-
-
-async def show_accessible_groups(query, context: ContextTypes.DEFAULT_TYPE):
-    user_id = query.from_user.id
-    username = query.from_user.username
-    is_special = username and username.lower() in [u.lower() for u in SPECIAL_USERS]
-    chat_id_str = str(query.message.chat_id)
-
-    # Отримуємо налаштування чату
-    settings = notification_chats.get(chat_id_str, {})
-    user_groups = settings.get('groups', [])
-
-    # Шукаємо групу адміністратора з його акаунта
-    user_group = None
-    if not is_special:
-        # Шукаємо акаунт, який відповідає адміністратору
-        for client in clients.values():
-            if client.me and client.me.id == user_id:
-                user_group = client.account_data.get('group', '')
-                break
-
-        # Якщо не знайшли, використовуємо ім'я користувача
-        if not user_group:
-            user_group = username if username else f"ID: {user_id}"
-
-    # Визначаємо доступні групи
-    if is_special:
-        # Для спеціальних користувачів - всі обрані групи
-        groups_text = "🏷️ Ваші доступні групи:\n\n" + "\n".join(f"• `{group}`" for group in user_groups)
-        if not user_groups:
-            groups_text = "ℹ️ Ви ще не обрали жодної групи. Використайте '➕ Обрати групу'."
-    else:
-        # Для звичайних адміністраторів - тільки їх група
-        groups_text = f"🏷️ Ваша група: `{user_group}`"
-
-    await query.edit_message_text(
-        groups_text,
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
-        ])
-    )
-
-
-# Функція для показу вибору груп (для спеціальних користувачів)
-async def show_group_selection(query, context: ContextTypes.DEFAULT_TYPE):
-    # Отримуємо унікальні групи з усіх акаунтів
-    all_groups = set()
-    for client in clients.values():
-        all_groups.add(client.account_data['group'])
-
-    if not all_groups:
-        await query.edit_message_text("ℹ️ Немає доступних груп для вибору.")
-        return
-
-    # Створюємо клавіатуру з кнопками груп
-    keyboard = []
-    current_row = []
-
-    for group in sorted(all_groups):
-        # Перевіряємо, чи група вже вибрана
-        is_selected = False
-        chat_id_str = str(query.message.chat_id)
-        if chat_id_str in notification_chats and group in notification_chats[chat_id_str].get('groups', []):
-            is_selected = True
-
-        btn_text = f"✅ {group}" if is_selected else group
-        current_row.append(InlineKeyboardButton(btn_text, callback_data=f"toggle_group:{group}"))
-
-        if len(current_row) == 2:
-            keyboard.append(current_row)
-            current_row = []
-
-    if current_row:
-        keyboard.append(current_row)
-
-    # Кнопки для збереження та скидання
-    keyboard.append([
-        InlineKeyboardButton("💾 Зберегти вибір", callback_data="save_groups"),
-        InlineKeyboardButton("🧹 Скинути всі", callback_data="reset_groups"),
-        InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")
-    ])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    selected_count = 0
-    chat_id_str = str(query.message.chat_id)
-    if chat_id_str in notification_chats:
-        selected_count = len(notification_chats[chat_id_str].get('groups', []))
-
-    await query.edit_message_text(
-        f"🏷️ Виберіть групи для моніторингу (вибрано: {selected_count}):\n\n"
-        "ℹ️ Натисніть на групу, щоб додати або видалити її зі списку",
-        reply_markup=reply_markup
-    )
-
-
-# Обробник для кнопок груп
-async def group_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "select_group":
-        await show_group_selection(query, context)
-    elif query.data.startswith("toggle_group:"):
-        await toggle_group_handler(update, context)
-    elif query.data == "save_groups":
-        await save_groups_handler(update, context)
-    elif query.data == "reset_groups":
-        await reset_groups_handler(update, context)
-    elif query.data == "back_to_main":
-        await start(update, context)
-
-
-async def toggle_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = query.message.chat_id
-    chat_id_str = str(chat_id)
-    _, group = query.data.split(':')
-
-    # Ініціалізуємо налаштування для чату, якщо потрібно
-    if chat_id_str not in notification_chats:
-        notification_chats[chat_id_str] = {
-            'user_id': query.from_user.id,
-            'groups': []
-        }
-
-    settings = notification_chats[chat_id_str]
-
-    # Додаємо або видаляємо групу
-    if group in settings['groups']:
-        settings['groups'].remove(group)
-    else:
-        settings['groups'].append(group)
-
-    await save_notification_chats()
-    await show_group_selection(query, context)
-
-
-async def save_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = query.message.chat_id
-    chat_id_str = str(chat_id)
-    selected_count = 0
-
-    if chat_id_str in notification_chats:
-        selected_count = len(notification_chats[chat_id_str].get('groups', []))
-
-    await query.edit_message_text(
-        f"✅ Вибрано груп: {selected_count}\n\n"
-        "Тепер ви будете отримувати сповіщення лише для обраних груп."
-    )
-
-
-async def reset_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = query.message.chat_id
-    chat_id_str = str(chat_id)
-
-    if chat_id_str in notification_chats:
-        notification_chats[chat_id_str]['groups'] = []
-        await save_notification_chats()
-
-    await query.edit_message_text("🧹 Всі групи скинуті! Ви не отримуватимете сповіщень.")
-
-
-def get_admin_group(user_id):
-    for client in clients.values():
-        if client.me and client.me.id == user_id:
-            return client.account_data.get('group', '')
-    return None
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        user = query.from_user
-        message = query.message
-    else:
-        user = update.effective_user
-        message = update.message
-
-    user_id = user.id
-    username = user.username
-    chat_id = message.chat_id
-    chat_id_str = str(chat_id)
-    is_special = username and username.lower() in [u.lower() for u in SPECIAL_USERS]
-
-    # Перевіряємо чи є користувач адміном або спеціальним
-    if not (is_admin(user_id) or is_special):
-        text = "❌ Ви не маєте доступу до цього бота. Зверніться до адміністратора."
-        if update.callback_query:
-            await query.edit_message_text(text)
-        else:
-            await message.reply_text(text)
-        return
-
-    # Ініціалізація чату тільки для адмінів та спеціальних користувачів
-    if chat_id_str not in notification_chats:
-        notification_chats[chat_id_str] = {
-            'user_id': user_id,
-            'username': username,
-            'groups': [],
-            'is_special': is_special
-        }
-
-        # Автоматично додаємо групу для звичайних адмінів
-        if not is_special and is_admin(user_id):
-            admin_group = get_admin_group(user_id)
-            if admin_group:
-                notification_chats[chat_id_str]['groups'] = [admin_group]
-                await save_notification_chats()
-                logger.info(f"Автоматично додано групу {admin_group} для адміна {user_id}")
-    else:
-        # Оновлюємо дані користувача
-        notification_chats[chat_id_str]['user_id'] = user_id
-        notification_chats[chat_id_str]['username'] = username
-        notification_chats[chat_id_str]['is_special'] = is_special
-
-    # Якщо це звичайний адмін без груп - додаємо його групу
-    settings = notification_chats[chat_id_str]
-    if not settings['is_special'] and is_admin(user_id) and not settings.get('groups'):
-        admin_group = get_admin_group(user_id)
-        if admin_group:
-            settings['groups'] = [admin_group]
-            await save_notification_chats()
-            logger.info(f"Додано групу {admin_group} для адміна {user_id}")
-
-    # Визначаємо статус користувача
-    if is_special:
-        admin_status = "⭐ Ви спеціальний користувач (повний доступ)"
-    elif is_admin(user_id):
-        admin_status = "✅ Ви адміністратор"
-    else:
-        admin_status = "❌ Ви не маєте прав адміністратора"
-
-    # Створюємо клавіатуру в залежності від типу користувача
-    keyboard = []
-
-    # Кнопки для спеціальних користувачів
-    if is_special:
-        keyboard.append([
-            InlineKeyboardButton("➕ Обрати групу", callback_data="select_group"),
-        ])
-        keyboard.append([
-            InlineKeyboardButton("🔔 Перевірити сповіщення", callback_data="check_notifications"),
-            InlineKeyboardButton("👁️ Доступні групи", callback_data="view_groups")
-        ])
-
-    # Кнопки для звичайних адміністраторів
-    elif is_admin(user_id):
-        keyboard.append([
-            InlineKeyboardButton("🔔 Перевірити сповіщення", callback_data="check_notifications"),
-            InlineKeyboardButton("👁️ Моя група", callback_data="view_groups")
-        ])
-
-    # Кнопки для всіх користувачів
-    keyboard.append([
-        InlineKeyboardButton("🔄 Оновити", callback_data="refresh"),
-        InlineKeyboardButton("❌ Закрити", callback_data="close")
-    ])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    text = f"🔔 Бот активований! {admin_status}\n\nОберіть дію з меню:"
-
-    # Відповідаємо в залежності від типу запиту
-    if update.callback_query:
-        await query.edit_message_text(text, reply_markup=reply_markup)
-    else:
-        await message.reply_text(text, reply_markup=reply_markup)
-
-
-async def account_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    _, phone = query.data.split(':')
-    client = clients.get(phone)
-
-    if client:
-        group = client.account_data['group']
-        status = "⭐ Спеціальний акаунт" if client.is_special else "🛟 Звичайний акаунт"
-
-        await query.edit_message_text(
-            f"ℹ️ Інформація про акаунт:\n\n"
-            f"📱 Телефон: {phone}\n"
-            f"👤 Ім'я: {client.account_data['name']}\n"
-            f"🏷️ Група: {group}\n"
-            f"{status}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Назад", callback_data="view_account_group")]
-            ])
-        )
-
-
-async def view_account_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    keyboard = []
-    for client in clients.values():
-        account = client.account_data
-        btn_text = f"{account['name']} ({account['phone']})"
-        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"account_group:{account['phone']}")])
-
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")])
-
-    await query.edit_message_text(
-        "👤 Оберіть акаунт для перегляду його групи:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def set_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Якщо це виклик з кнопки, використовуємо query
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        update.message = query.message
-        update.effective_chat = query.message.chat
-
-    return await group_selection_required(update, context, _set_groups)
-
-
-async def _set_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Визначаємо тип виклику
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        chat = query.message.chat
-        user = query.from_user
-    else:
-        chat = update.effective_chat
-        user = update.effective_user
-
-    username = user.username
-    is_special = username and username.lower() in [u.lower() for u in SPECIAL_USERS]
-
-    if not is_special:
-        if update.callback_query:
-            await query.edit_message_text("❌ Тільки спеціальні користувачі можуть вибирати групи!")
-        else:
-            await update.message.reply_text("❌ Тільки спеціальні користувачі можуть вибирати групи!")
-        return
-
-    chat_id = update.effective_chat.id
-    chat_id_str = str(chat_id)
-    user_id = update.effective_user.id
-
-    # Отримуємо унікальні групи
-    all_groups = set()
-    special_groups = set()
-
-    for client in clients.values():
-        group = client.account_data['group']
-        all_groups.add(group)
-        if client.is_special:
-            special_groups.add(group)
-
-    # Для звичайних адміністраторів показуємо тільки неспеціальні групи
-    if user_id not in SPECIAL_USERS:
-        all_groups = all_groups - special_groups
-        if not all_groups:
-            await update.message.reply_text("ℹ️ Немає доступних груп для вашого рівня доступу.")
-            return
-
-    # Створюємо клавіатуру з кнопками груп
-    keyboard = []
-    current_row = []
-
-    for group in sorted(all_groups):
-        # Перевіряємо, чи група вже вибрана
-        is_selected = False
-        if chat_id_str in notification_chats and group in notification_chats[chat_id_str].get('groups', []):
-            is_selected = True
-
-        # Позначаємо спеціальні групи
-        group_display = group
-        if group in special_groups:
-            group_display = f"⭐ {group}"
-
-        btn_text = f"✅ {group_display}" if is_selected else group_display
-        current_row.append(InlineKeyboardButton(btn_text, callback_data=f"toggle_group:{group}"))
-
-        if len(current_row) == 2:
-            keyboard.append(current_row)
-            current_row = []
-
-    if current_row:
-        keyboard.append(current_row)
-
-    # Кнопки для збереження та скидання
-    keyboard.append([
-        InlineKeyboardButton("💾 Зберегти вибір", callback_data="save_groups"),
-        InlineKeyboardButton("🧹 Скинути всі", callback_data="reset_groups")
-    ])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    selected_count = 0
-    if chat_id_str in notification_chats:
-        selected_count = len(notification_chats[chat_id_str].get('groups', []))
-
-    # Додаємо пояснення про спеціальні групи
-    explanation = "\n\n⭐ - Спеціальні групи (доступні всім акаунтам)" if special_groups else ""
-
-    await update.message.reply_text(
-        f"🏷️ Виберіть групи для моніторингу (вибрано: {selected_count}):{explanation}\n\n"
-        "ℹ️ Натисніть на групу, щоб додати або видалити її зі списку",
-        reply_markup=reply_markup
-    )
-
-
-async def my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await admin_required(update, context, _my_groups)
-
-
-async def _my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if query:
-        await query.answer()
-        chat_id = query.message.chat_id
-        chat_id_str = str(chat_id)
-    else:
-        chat_id = update.effective_chat.id
-        chat_id_str = str(chat_id)
-
-    if chat_id_str not in notification_chats or not notification_chats[chat_id_str].get('groups'):
-        # Використовуємо правильний спосіб відповіді для callback
-        if query:
-            await query.edit_message_text("ℹ️ Ви ще не вибрали жодної групи для моніторингу.")
-        else:
-            await update.message.reply_text("ℹ️ Ви ще не вибрали жодної групи для моніторингу.")
-        return
-
-    groups = notification_chats[chat_id_str]['groups']
-    response = "🏷️ Ваші вибрані групи:\n\n" + "\n".join(f"• `{group}`" for group in groups)
-
-    # Додаємо попередження для неспеціальних користувачів
-    user_id = update.effective_user.id
-    if user_id not in SPECIAL_USERS:
-        response += "\n\nℹ️ Зверніть увагу: ви не можете змінювати цей список, оскільки не є спеціальним користувачем"
-
-    # Використовуємо правильний спосіб відповіді
-    if query:
-        await query.edit_message_text(response, parse_mode='Markdown')
-    else:
-        await update.message.reply_text(response, parse_mode='Markdown')
-
-
-# async def toggle_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#    query = update.callback_query
-#    await query.answer()
-#
-#    chat_id = query.message.chat_id
-#    chat_id_str = str(chat_id)
-#    action, group = query.data.split(':')
-#
-#    # Ініціалізуємо налаштування для чату, якщо потрібно
-#    if chat_id_str not in notification_chats:
-#        notification_chats[chat_id_str] = {
-#            'user_id': query.from_user.id,
-#            'groups': []
-#        }
-#
-#    settings = notification_chats[chat_id_str]
-#
-#    # Додаємо або видаляємо групу
-#    if group in settings['groups']:
-#        settings['groups'].remove(group)
-#    else:
-#        settings['groups'].append(group)
-#
-#    await save_notification_chats()
-#    await show_group_selection(query, context)
-#
-
-async def _toggle_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = query.message.chat_id
-    chat_id_str = str(chat_id)
-    action, group = query.data.split(':')
-
-    # Ініціалізуємо налаштування для чату, якщо потрібно
-    if chat_id_str not in notification_chats:
-        notification_chats[chat_id_str] = {
-            'user_id': query.from_user.id,
-            'groups': []
-        }
-
-    settings = notification_chats[chat_id_str]
-
-    # Додаємо або видаляємо групу
-    if group in settings['groups']:
-        settings['groups'].remove(group)
-    else:
-        settings['groups'].append(group)
-
-    await save_notification_chats()
-
-    # Оновлюємо повідомлення з новим станом кнопок
-    await update_group_buttons(query)
-
-
-async def _save_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = query.message.chat_id
-    chat_id_str = str(chat_id)
-    selected_count = 0
-
-    if chat_id_str in notification_chats:
-        selected_count = len(notification_chats[chat_id_str].get('groups', []))
-
-    await query.edit_message_text(
-        f"✅ Вибрано груп: {selected_count}\n\n"
-        "Тепер ви будете отримувати сповіщення лише для обраних груп."
-    )
-
-
-async def _reset_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = query.message.chat_id
-    chat_id_str = str(chat_id)
-
-    if chat_id_str in notification_chats:
-        notification_chats[chat_id_str]['groups'] = []
-        await save_notification_chats()
-
-    await query.edit_message_text("🧹 Всі групи скинуті! Ви не отримуватимете сповіщень.")
-
-
-async def update_group_buttons(query):
-    chat_id = query.message.chat_id
-    chat_id_str = str(chat_id)
-    user_id = query.from_user.id
-
-    # Отримуємо групи
-    all_groups = set()
-    special_groups = set()
-    for client in clients.values():
-        group = client.account_data['group']
-        all_groups.add(group)
-        if client.is_special:
-            special_groups.add(group)
-
-    # Для звичайних адміністраторів показуємо тільки неспеціальні групи
-    if user_id not in SPECIAL_USERS:
-        all_groups = all_groups - special_groups
-
-    # Створюємо нову клавіатуру з оновленими станами
-    keyboard = []
-    current_row = []
-
-    for group in sorted(all_groups):
-        # Перевіряємо, чи група вибрана
-        is_selected = False
-        if chat_id_str in notification_chats and group in notification_chats[chat_id_str].get('groups', []):
-            is_selected = True
-
-        # Позначаємо спеціальні групи
-        group_display = group
-        if group in special_groups:
-            group_display = f"⭐ {group}"
-
-        btn_text = f"✅ {group_display}" if is_selected else group_display
-        current_row.append(InlineKeyboardButton(btn_text, callback_data=f"toggle_group:{group}"))
-
-        if len(current_row) == 2:
-            keyboard.append(current_row)
-            current_row = []
-
-    if current_row:
-        keyboard.append(current_row)
-
-    # Кнопки для збереження та скидання
-    keyboard.append([
-        InlineKeyboardButton("💾 Зберегти вибір", callback_data="save_groups"),
-        InlineKeyboardButton("🧹 Скинути всі", callback_data="reset_groups")
-    ])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    selected_count = 0
-    if chat_id_str in notification_chats:
-        selected_count = len(notification_chats[chat_id_str].get('groups', []))
-
-    await query.edit_message_text(
-        f"🏷️ Виберіть групи для моніторингу (вибрано: {selected_count}):\n\n"
-        "ℹ️ Натисніть на групу, щоб додати або видалити її зі списку",
-        reply_markup=reply_markup
-    )
-
-
-async def check_unread(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await admin_required(update, context, _check_unread)
-
-
-async def _check_unread(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if query:
-        await query.answer()
-        chat_id = query.message.chat_id
-        chat_id_str = str(chat_id)
-        message = query.message
-    else:
-        chat_id = update.effective_chat.id
-        chat_id_str = str(chat_id)
-        message = update.message
-
-    # Отримуємо налаштування чату
-    settings = notification_chats.get(chat_id_str, {})
-    username = settings.get('username')
-    is_special = username and username.lower() in [u.lower() for u in SPECIAL_USERS]
-    user_groups = settings.get('groups', [])
-
-    # Визначаємо групу адміністратора З АКАУНТІВ
-    admin_group = None
-    user_id = update.effective_user.id
-
-    # Шукаємо акаунт, який відповідає адміністратору
-    for client in clients.values():
-        if client.me and client.me.id == user_id:
-            admin_group = client.account_data.get('group', '')
-            break
-
-    # Якщо не знайшли, використовуємо ім'я користувача як запасний варіант
-    if not admin_group:
-        admin_group = username if username else str(user_id)
-
-    # Створюємо клавіатуру
-    keyboard = [
-        [InlineKeyboardButton("🔄 Перевірити зараз", callback_data="check_now")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    # Визначаємо доступні групи
-    if is_special:
-        groups_text = "обраних групах" if user_groups else "всіх групах"
-    else:
-        groups_text = f"групі `{admin_group}`"
-
-    message_text = f"Натисніть кнопку для перевірки непрочитаних повідомлень у {groups_text}:"
-
-    # Використовуємо правильний спосіб відповіді
-    if query:
-        await query.edit_message_text(message_text, reply_markup=reply_markup)
-    else:
-        await message.reply_text(message_text, reply_markup=reply_markup)
-
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-
-    await query.answer()
-    user_id = query.from_user.id
-    username = query.from_user.username
-    is_special = username and username.lower() in [u.lower() for u in SPECIAL_USERS]
-    chat_id_str = str(query.message.chat_id)
-
-    if query.data == "select_group":
-        if is_special:
-            await show_group_selection(query, context)
-        else:
-            await query.edit_message_text("❌ Ця дія доступна тільки для спеціальних користувачів!")
-
-    elif query.data == "check_notifications":
-        if is_admin(user_id) or is_special:
-            await check_unread(update, context)
-        else:
-            await query.edit_message_text("❌ Ви не маєте прав для цієї дії!")
-
-    elif query.data == "view_groups":
-        if is_admin(user_id) or is_special:
-            await show_accessible_groups(query, context)
-        else:
-            await query.edit_message_text("❌ Ви не маєте прав для цієї дії!")
-    elif query.data == "check_now":
-        await handle_unread_messages(query, context)
-    elif query.data == "refresh":
-        await start(update, context)
-
-    elif query.data == "close":
-        await query.delete_message()
-
-        # ADD HANDLER FOR BACK BUTTONS
-    elif query.data == "back_to_main":
-        await start(update, context)
-    elif query.data == "view_account_group":
-        await view_account_group(update, context)
-
-
-async def handle_unread_messages(query, context: ContextTypes.DEFAULT_TYPE):
-    bot = context.bot
-    chat_id = query.message.chat_id
-    chat_id_str = str(chat_id)
-    await query.edit_message_text("🔍 Перевіряю непрочитані повідомлення...")
-
-    # Отримуємо налаштування чату
-    settings = notification_chats.get(chat_id_str, {})
-    username = settings.get('username')
-    is_special = username and username.lower() in [u.lower() for u in SPECIAL_USERS]
-    user_groups = settings.get('groups', [])
-
-    # Отримуємо user_id користувача
-    user_id = query.from_user.id
-
-    # Визначаємо групи для перевірки
-    if is_special:
-        # Для спеціальних користувачів - всі обрані групи
-        groups_to_check = user_groups
-    else:
-        # Для звичайних адміністраторів - шукаємо групу з акаунта
-        groups_to_check = []
-
-        # Шукаємо акаунт, який відповідає адміністратору
-        for client in clients.values():
-            if client.me and client.me.id == user_id:
-                group = client.account_data.get('group', '')
-                if group:
-                    groups_to_check = [group]
-                    break
-
-        # Якщо не знайшли, використовуємо ім'я користувача як запасний варіант
-        if not groups_to_check:
-            groups_to_check = [username] if username else [str(user_id)]
-
-    messages = []
-    accounts_in_group = 0
-
-    for phone, client in list(clients.items()):
-        try:
-            # Отримуємо групу клієнта
-            client_group = client.account_data.get('group', '')
-
-            # Перевіряємо чи група клієнта входить у список для перевірки
-            if groups_to_check and client_group not in groups_to_check:
-                continue
-
-            accounts_in_group += 1  # Лічильник акаунтів у групі
-
-            if not client.is_running:
-                await client.start()
-
-            unread_dialogs = []
-
-            async for dialog in client.client.iter_dialogs():
-                # Ігноруємо ботів, групи і канали
-                if not isinstance(dialog.entity, types.User) or dialog.entity.bot:
-                    continue
-
-                # Фільтруємо лише діалоги з непрочитаними
-                if dialog.unread_count > 0:
-                    # Отримуємо ім'я користувача
-                    user = dialog.entity
-                    username = user.username or f"{user.first_name or ''} {user.last_name or ''}".strip()
-                    if not username:
-                        username = f"user_{user.id}"
-
-                    unread_dialogs.append({
-                        'username': username,
-                        'count': dialog.unread_count,
-                        'user_id': user.id
-                    })
-
-            if not unread_dialogs:
-                messages.append({
-                    'account': client.account_data['name'],
-                    'status': "✅ Немає непрочитаних повідомлень",
-                    'group': client_group
-                })
-            else:
-                messages.append({
-                    'account': client.account_data['name'],
-                    'dialogs': unread_dialogs,
-                    'total': sum(d['count'] for d in unread_dialogs),
-                    'group': client_group
-                })
-
-        except Exception as e:
-            logger.error(f"Помилка перевірки акаунта {phone}: {e}")
-            messages.append({
-                'account': client.account_data['name'],
-                'status': f"❌ Помилка: {str(e)[:100]}",
-                'group': client.account_data.get('group', '')
+        accounts_to_save = []
+        for account in st.session_state.accounts:
+            accounts_to_save.append({
+                'group': account['group'],
+                'name': account['name'],
+                'phone': account['phone'],
+                'session_string': account['session_string'],
+                'last_updated': account['last_updated'],
+                'is_admin': account.get('is_admin', False),
+                'skip_check': account.get('skip_check', False)
             })
 
-    # Формуємо відповідь частинами
-    if accounts_in_group == 0:
-        group_text = ", ".join(groups_to_check) if groups_to_check else "групах"
+        data = {
+            "accounts": accounts_to_save,
+            "groups": st.session_state.groups,
+            "last_saved": datetime.now()
+        }
 
-        # Отримуємо список усіх груп з акаунтів
-        all_groups = set()
-        for client in clients.values():
-            group = client.account_data.get('group', '')
-            if group:
-                all_groups.add(group)
-
-        await query.edit_message_text(
-            f"ℹ️ Не знайдено акаунтів у групах: {group_text}\n\n"
-            f"Доступні групи: {', '.join(all_groups) if all_groups else 'немає груп в акаунтах'}"
-        )
-        return
-
-    response_parts = ["📬 **Непрочитані повідомлення:**\n\n"]
-
-    for msg in messages:
-        account_line = f"👤 **{msg['account']}**\n🏷️ Група: `{msg['group']}`\n"
-
-        if 'dialogs' in msg:
-            dialogs_text = f"🔢 Всього непрочитаних: {msg['total']}\n"
-            for dialog in msg['dialogs']:
-                dialogs_text += f"👤 `{dialog['username']}`: {dialog['count']} непрочитаних\n"
-
-            # Додаємо до останньої частини або створюємо нову
-            if len(response_parts[-1]) + len(account_line) + len(dialogs_text) > 3800:
-                response_parts.append("")
-
-            response_parts[-1] += account_line + dialogs_text + "\n"
-        else:
-            if len(response_parts[-1]) + len(account_line) + len(msg['status']) > 3800:
-                response_parts.append("")
-
-            response_parts[-1] += account_line + msg['status'] + "\n\n"
-
-    # Відправляємо частини повідомлення
-    for i, part in enumerate(response_parts):
-        if i == 0:
-            await query.edit_message_text(
-                text=part,
-                parse_mode='Markdown'
-            )
-        else:
-            await bot.send_message(
-                chat_id=query.message.chat_id,
-                text=part,
-                parse_mode='Markdown'
-            )
-
-
-async def manage_special(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Дозволяємо тільки спеціальним користувачам
-    user_id = update.effective_user.id
-    if user_id not in SPECIAL_USERS:
-        await update.message.reply_text("❌ Ця команда доступна тільки для спеціальних користувачів!")
-        return
-
-
-async def _manage_special(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Створюємо список акаунтів з можливістю зміни статусу
-    keyboard = []
-    for phone, client in clients.items():
-        account = client.account_data
-        status = "✅" if client.is_special else "❌"
-        btn_text = f"{status} {account['name']} ({account['phone']})"
-        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"toggle_special:{phone}")])
-
-    keyboard.append([InlineKeyboardButton("💾 Зберегти зміни", callback_data="save_special")])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        "⭐ Керування спеціальними акаунтами:\n\n"
-        "Оберіть акаунт, щоб змінити його статус:",
-        reply_markup=reply_markup
-    )
-
-
-async def toggle_special_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await admin_required(update, context, _toggle_special_handler)
-
-
-async def _toggle_special_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    _, phone = query.data.split(':')
-    client = clients.get(phone)
-
-    if client:
-        # Змінюємо статус
-        client.is_special = not client.is_special
-        # Оновлюємо дані акаунта
-        client.account_data['is_special'] = client.is_special
-
-        # Оновлюємо кнопки
-        await update_special_buttons(query)
-
-
-async def update_special_buttons(query):
-    keyboard = []
-    for phone, client in clients.items():
-        account = client.account_data
-        status = "✅" if client.is_special else "❌"
-        btn_text = f"{status} {account['name']} ({account['phone']})"
-        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"toggle_special:{phone}")])
-
-    keyboard.append([InlineKeyboardButton("💾 Зберегти зміни", callback_data="save_special")])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        "⭐ Керування спеціальними акаунтами:\n\n"
-        "Оберіть акаунт, щоб змінити його статус:",
-        reply_markup=reply_markup
-    )
-
-
-async def save_special_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    # Зберігаємо зміни у файл
-    try:
-        # Завантажуємо поточні дані
-        if os.path.exists(ACCOUNTS_FILE):
-            with open(ACCOUNTS_FILE, 'rb') as f:
-                data = pickle.load(f)
-        else:
-            data = {"accounts": [], "groups": []}
-
-        # Оновлюємо статуси спеціальних акаунтів
-        for i, account in enumerate(data['accounts']):
-            for client in clients.values():
-                if account['phone'] == client.account_data['phone']:
-                    data['accounts'][i]['is_special'] = client.is_special
-
-        # Зберігаємо зміни
         with open(ACCOUNTS_FILE, 'wb') as f:
             pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-        await query.edit_message_text("✅ Зміни успішно збережено!")
-    except Exception as e:
-        logger.error(f"Помилка збереження спеціальних акаунтів: {e}")
-        await query.edit_message_text(f"❌ Помилка збереження: {str(e)}")
+    except Exception:
+        st.error("Помилка збереження даних")
 
-
-async def check_accounts_updates():
-    """Періодично перевіряє оновлення файлу акаунтів"""
-    global last_accounts_check
-
-    while True:
+def load_accounts_from_file():
+    if os.path.exists(ACCOUNTS_FILE):
         try:
-            # Перевіряємо кожні 30 секунд
-            await asyncio.sleep(30)
+            with open(ACCOUNTS_FILE, 'rb') as f:
+                data = pickle.load(f)
 
-            # Оновлюємо акаунти, якщо файл змінився
-            if await load_accounts():
-                logger.info("Оновлено акаунти з файлу")
+            accounts_data = data.get("accounts", [])
+            groups = data.get("groups", [])
+            last_saved = data.get('last_saved', datetime.now())
 
-                # Перезапускаємо слухачі повідомлень
-                for client in clients.values():
-                    if client.is_running:
-                        asyncio.create_task(message_listener(client))
-        except Exception as e:
-            logger.error(f"Помилка перевірки оновлень акаунтів: {e}")
+            accounts = []
+            for account in accounts_data:
+                acc = {
+                    'group': account.get('group', ''),
+                    'name': account.get('name', ''),
+                    'phone': account.get('phone', ''),
+                    'session_string': account.get('session_string', ''),
+                    'last_updated': account.get('last_updated', None),
+                    'is_admin': account.get('is_admin', False),
+                    'skip_check': account.get('skip_check', False),
+                    'client': None,
+                    'unread_count': account.get('unread_count', 0),
+                    'oldest_unread': account.get('oldest_unread', None),
+                    'status': account.get('status', '?')
+                }
+                accounts.append(acc)
 
+            return accounts, groups, last_saved
+        except Exception:
+            pass
 
-async def main():
-    global logger
-    logger = setup_logging()
-    logger.info("=== Бот запущено ===")
+    old_json_file = "telegram_accounts.json"
+    if os.path.exists(old_json_file):
+        try:
+            with open(old_json_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
 
-    # Решта коду...
+            if isinstance(data, dict) and "accounts" in data and "groups" in data:
+                accounts_data = data["accounts"]
+                groups = data["groups"]
+            else:
+                accounts_data = data
+                groups = sorted(set(account.get('group', '') for account in accounts_data))
 
-    await load_notification_chats()
-    # Ініціалізація бота
-    application = Application.builder().token(BOT_TOKEN).build()
-    # Завантаження даних
+            accounts = []
+            for account in accounts_data:
+                last_updated = account.get('last_updated')
+                if last_updated and isinstance(last_updated, str):
+                    try:
+                        last_updated = datetime.fromisoformat(last_updated)
+                    except:
+                        last_updated = None
+                else:
+                    last_updated = None
 
-    await load_accounts()
+                acc = {
+                    'group': account.get('group', ''),
+                    'name': account.get('name', ''),
+                    'phone': account.get('phone', ''),
+                    'session_string': account.get('session_string', ''),
+                    'last_updated': last_updated,
+                    'is_admin': account.get('is_admin', False),
+                    'skip_check': account.get('skip_check', False),
+                    'client': None,
+                    'unread_count': account.get('unread_count', 0),
+                    'oldest_unread': account.get('oldest_unread', None),
+                    'status': account.get('status', '?')
+                }
+                accounts.append(acc)
 
-    # Запуск обробників
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("set_groups", set_groups))
-    application.add_handler(CommandHandler("my_groups", my_groups))
-    application.add_handler(CommandHandler("check_unread", check_unread))
-    application.add_handler(CommandHandler("manage_special", manage_special))
-    # У функції main:
-    application.add_handler(CommandHandler("set_groups",
-                                           lambda update, context: group_selection_required(update, context,
-                                                                                            set_groups)))
+            data_to_save = {
+                "accounts": accounts,
+                "groups": groups,
+                "last_saved": datetime.now()
+            }
+            with open(ACCOUNTS_FILE, 'wb') as f:
+                pickle.dump(data_to_save, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    application.add_handler(CallbackQueryHandler(
-        lambda update, context: group_selection_required(update, context, toggle_group_handler),
-        pattern="^toggle_group:"))
+            os.rename(old_json_file, old_json_file + ".old")
+            return accounts, groups, datetime.now()
+        except Exception:
+            return [], [], None
+    else:
+        return [], [], None
 
-    application.add_handler(CallbackQueryHandler(
-        lambda update, context: group_selection_required(update, context, save_groups_handler),
-        pattern="^save_groups$"))
+def init_session_state():
+    required_states = {
+        'current_account': None,
+        'login_stage': 'start',
+        'phone_code_hash': None,
+        'phone': None,
+        'group_name': '',
+        'stats_updated': 0,
+        'editing_account_index': None,
+        'active_form': None,
+        'editing_group': None,
+        'group_to_delete': None,
+        'last_full_update': datetime.min
+    }
 
-    application.add_handler(CallbackQueryHandler(
-        lambda update, context: group_selection_required(update, context, reset_groups_handler),
-        pattern="^reset_groups$"))
-    application.add_handler(CallbackQueryHandler(button_handler, pattern="^check_now$"))
-    application.add_handler(CallbackQueryHandler(toggle_group_handler, pattern="^toggle_group:"))
-    application.add_handler(CallbackQueryHandler(save_groups_handler, pattern="^save_groups$"))
-    application.add_handler(CallbackQueryHandler(reset_groups_handler, pattern="^reset_groups$"))
-    application.add_handler(CallbackQueryHandler(toggle_special_handler, pattern="^toggle_special:"))
-    application.add_handler(CallbackQueryHandler(save_special_handler, pattern="^save_special$"))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(CallbackQueryHandler(account_group_handler, pattern="^account_group:"))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(CallbackQueryHandler(
-        lambda update, context: group_selection_required(update, context, group_button_handler),
-        pattern="^(toggle_group|save_groups|reset_groups|back_to_main)"
-    ))
-    # Запуск слухачів повідомлень
-    for client in clients.values():
-        if client.is_running:
-            asyncio.create_task(message_listener(client))
+    for key, default in required_states.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
 
-    # Запуск обробки черги повідомлень
-    asyncio.create_task(process_message_queue(application.bot))
+    if 'accounts' not in st.session_state or 'groups' not in st.session_state:
+        accounts, groups, last_saved = load_accounts_from_file()
+        st.session_state.accounts = accounts
+        st.session_state.groups = groups
+        if last_saved:
+            st.session_state.last_saved = last_saved
 
-    # Запуск перевірки оновлень акаунтів
-    asyncio.create_task(check_accounts_updates())
+    for account in st.session_state.accounts:
+        account.setdefault('unread_count', 0)
+        account.setdefault('oldest_unread', None)
+        account.setdefault('status', '?')
+        account.setdefault('last_updated', None)
+        account.setdefault('is_admin', False)
+        account.setdefault('skip_check', False)
+        account.setdefault('client', None)
 
-    # Запуск бота
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
+async def create_client(session_string=None):
+    if session_string:
+        for account in st.session_state.accounts:
+            if account.get('session_string') == session_string and account.get('client'):
+                try:
+                    if await account['client'].is_connected():
+                        return account['client']
+                except:
+                    pass
 
-    # Запуск основного циклу
+    client = TelegramClient(
+        StringSession(session_string) if session_string else StringSession(),
+        API_ID,
+        API_HASH,
+        loop=st.session_state.loop
+    )
+    client.flood_sleep_threshold = 0
+    await client.connect()
+
+    if session_string:
+        for account in st.session_state.accounts:
+            if account.get('session_string') == session_string:
+                account['client'] = client
+
+    return client
+
+async def login():
+    st.subheader("Додати новий акаунт")
+    groups = st.session_state.groups
+    selected_group = st.selectbox(
+        "Оберіть групу:",
+        groups,
+        index=0 if groups else None,
+        key="login_group_select"
+    )
+
+    if st.session_state.login_stage == 'start':
+        phone = st.text_input("Введіть номер телефону (у міжнародному форматі):", key="login_phone_input")
+
+        if st.button("Надіслати код", key="login_send_code_btn"):
+            try:
+                client = await create_client()
+                sent_code = await client.send_code_request(phone)
+                st.session_state.phone_code_hash = sent_code.phone_code_hash
+                st.session_state.phone = phone
+                st.session_state.group_name = selected_group
+                st.session_state.client = client
+                st.session_state.login_stage = 'phone_sent'
+                st.rerun()
+            except FloodWaitError as fwe:
+                st.error(f"Занадто багато спроб. Спробуйте через {fwe.seconds} секунд.")
+            except Exception:
+                st.error("Помилка авторизації")
+
+    elif st.session_state.login_stage == 'phone_sent':
+        code = st.text_input("Введіть отриманий код:", key="login_code_input")
+
+        if st.button("Увійти", key="login_sign_in_btn"):
+            try:
+                await st.session_state.client.sign_in(
+                    st.session_state.phone,
+                    code,
+                    phone_code_hash=st.session_state.phone_code_hash
+                )
+            except SessionPasswordNeededError:
+                st.session_state.login_stage = '2fa'
+                st.rerun()
+                return
+            except Exception:
+                st.error("Помилка авторизації")
+                await st.session_state.client.disconnect()
+                st.session_state.client = None
+                st.session_state.login_stage = 'start'
+                return
+
+            session_string = st.session_state.client.session.save()
+            me = await st.session_state.client.get_me()
+
+            new_account = {
+                'group': st.session_state.group_name,
+                'name': f"{me.first_name or ''} {me.last_name or ''}".strip() or me.username or me.phone,
+                'phone': me.phone,
+                'session_string': session_string,
+                'unread_count': 0,
+                'oldest_unread': None,
+                'status': '✓',
+                'last_updated': datetime.now(),
+                'is_admin': False,
+                'skip_check': False,
+                'client': None
+            }
+
+            st.session_state.accounts.append(new_account)
+
+            if st.session_state.group_name not in st.session_state.groups:
+                st.session_state.groups.append(st.session_state.group_name)
+                st.session_state.groups.sort()
+
+            save_accounts_to_file()
+            st.session_state.login_stage = 'start'
+            await st.session_state.client.disconnect()
+            st.session_state.client = None
+            st.session_state.active_form = None
+            st.success(f"Акаунт {new_account['name']} успішно додано до групи '{st.session_state.group_name}'!")
+            st.session_state.stats_updated += 1
+            st.rerun()
+
+    elif st.session_state.login_stage == '2fa':
+        password = st.text_input("Введіть пароль двофакторної аутентифікації:", type="password", key="login_2fa_input")
+
+        if st.button("Підтвердити", key="login_confirm_2fa_btn"):
+            try:
+                await st.session_state.client.sign_in(password=password)
+                session_string = st.session_state.client.session.save()
+                me = await st.session_state.client.get_me()
+
+                new_account = {
+                    'group': st.session_state.group_name,
+                    'name': f"{me.first_name or ''} {me.last_name or ''}".strip() or me.username or me.phone,
+                    'phone': me.phone,
+                    'session_string': session_string,
+                    'unread_count': 0,
+                    'oldest_unread': None,
+                    'status': '✓',
+                    'last_updated': datetime.now(),
+                    'is_admin': False,
+                    'skip_check': False
+                }
+
+                st.session_state.accounts.append(new_account)
+
+                if st.session_state.group_name not in st.session_state.groups:
+                    st.session_state.groups.append(st.session_state.group_name)
+                    st.session_state.groups.sort()
+
+                save_accounts_to_file()
+                st.session_state.login_stage = 'start'
+                await st.session_state.client.disconnect()
+                st.session_state.client = None
+                st.session_state.active_form = None
+                st.success(f"Акаунт {new_account['name']} успішно додано до групи '{st.session_state.group_name}'!")
+                st.session_state.stats_updated += 1
+                st.rerun()
+            except Exception:
+                st.error("Помилка авторизації")
+                await st.session_state.client.disconnect()
+                st.session_state.client = None
+                st.session_state.login_stage = 'start'
+
+async def get_unread_stats_for_account(account):
+    if account.get('skip_check', False):
+        account['status'] = '⏭️ Пропущено'
+        return
+
+    if 'attempts' not in account:
+        account['attempts'] = 0
+
+    MAX_ATTEMPTS = 2
+    client = None
     try:
-        while True:
-            await asyncio.sleep(3600)
-    except asyncio.CancelledError:
-        pass
+        client = await create_client(account['session_string'])
+
+        if not await client.is_user_authorized():
+            account['status'] = "Не авторизовано"
+            return
+
+        me = await client.get_me()
+        unread_chats_count = 0
+        oldest_unread_date = None
+
+        dialogs = await client.get_dialogs(limit=600)
+
+        for dialog in dialogs:
+            if not hasattr(dialog.entity, 'id') or dialog.entity.id == me.id:
+                continue
+
+            if getattr(dialog.entity, 'bot', False) or not isinstance(dialog.entity, types.User):
+                continue
+
+            if dialog.unread_count > 0:
+                unread_chats_count += 1
+
+                if oldest_unread_date is None or dialog.message.date < oldest_unread_date:
+                    oldest_unread_date = dialog.message.date
+
+        account['unread_count'] = unread_chats_count
+        account['oldest_unread'] = oldest_unread_date
+        account['status'] = '✓'
+        account['last_updated'] = datetime.now()
+        account['attempts'] = 0
+
+    except FloodWaitError as fwe:
+        account['attempts'] += 1
+
+        if account['attempts'] > MAX_ATTEMPTS:
+            account['status'] = f"❗ FloodWait {fwe.seconds}s"
+            return
+
+        wait_time = min(fwe.seconds + random.uniform(2, 5), 120)
+        account['status'] = f"⏳ Чекаємо {wait_time:.1f}с"
+        await asyncio.sleep(wait_time)
+        await get_unread_stats_for_account(account)
+
+    except Exception:
+        account['status'] = "⚠️ Помилка"
     finally:
-        # Коректне закриття
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
-        for client in clients.values():
-            await client.stop()
+        pass
 
+async def update_all_accounts():
+    if not st.session_state.accounts:
+        return
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    if (datetime.now() - st.session_state.last_full_update).total_seconds() < 1800:
+        st.info("Дані ще актуальні. Повне оновлення доступне раз на 30 хвилин.")
+        return
+
+    accounts_to_update = [acc for acc in st.session_state.accounts if not acc.get('skip_check', False)]
+    if not accounts_to_update:
+        st.info("Немає акаунтів для оновлення")
+        return
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    progress_counter = 0
+
+    def update_progress():
+        nonlocal progress_counter
+        progress_counter += 1
+        progress_bar.progress(progress_counter / len(accounts_to_update))
+        status_text.text(f"Оновлено {progress_counter}/{len(accounts_to_update)} акаунтів")
+
+    MAX_CONCURRENT = 4
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+    async def safe_update(account):
+        async with semaphore:
+            await get_unread_stats_for_account(account)
+            update_progress()
+            await asyncio.sleep(random.uniform(1, 3))
+
+    tasks = [safe_update(account) for account in accounts_to_update]
+    await asyncio.gather(*tasks)
+
+    progress_bar.empty()
+    status_text.empty()
+    st.session_state.last_full_update = datetime.now()
+    save_accounts_to_file()
+    st.success(f"Оновлення завершено для {len(accounts_to_update)} акаунтів!")
+
+def format_time_diff(oldest_unread_date):
+    if not oldest_unread_date:
+        return "-"
+
+    now = datetime.now(timezone.utc)
+    time_diff = now - oldest_unread_date
+
+    total_minutes = int(time_diff.total_seconds() // 60)
+
+    if total_minutes < 1:
+        return "<1 хв"
+    elif total_minutes < 60:
+        return f"{total_minutes} хв"
+
+    hours = total_minutes // 60
+    if hours < 24:
+        return f"{hours} год"
+
+    days = hours // 24
+    return f"{days} дн"
+
+def format_last_updated(last_updated):
+    if not last_updated:
+        return "ніколи"
+
+    now = datetime.now()
+    time_diff = now - last_updated
+    minutes = int(time_diff.total_seconds() // 60)
+
+    if minutes < 2:
+        return "щойно"
+    elif minutes < 60:
+        return f"{minutes} хв"
+
+    return last_updated.strftime("%d.%m %H:%M")
+
+def display_accounts_table():
+    if not st.session_state.accounts:
+        st.info("Додайте акаунт, щоб почати моніторинг")
+        return
+
+    data = []
+    for account in st.session_state.accounts:
+        group = account['group']
+        if account.get('is_admin', False):
+            group = f"👑 {group}"
+        if account.get('skip_check', False):
+            group = f"⏭️ {group}"
+
+        data.append({
+            "Група": group,
+            "Акаунт": account['name'],
+            "Повідомлення": account['unread_count'],
+            "Час": format_time_diff(account['oldest_unread']),
+            "Дані": account['status'],
+            "Оновлено": format_last_updated(account['last_updated'])
+        })
+
+    df = pd.DataFrame(data)
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Група": st.column_config.TextColumn(width="medium"),
+            "Акаунт": st.column_config.TextColumn(width="medium"),
+            "Повідомлення": st.column_config.NumberColumn(width="small"),
+            "Час": st.column_config.TextColumn(width="medium"),
+            "Дані": st.column_config.TextColumn(width="small"),
+            "Оновлено": st.column_config.TextColumn(width="medium")
+        }
+    )
+
+def edit_account_form(account_index):
+    account = st.session_state.accounts[account_index]
+
+    with st.form(key=f'edit_form_{account_index}'):
+        st.subheader(f"Редагування акаунта: {account['name']}")
+        groups = st.session_state.groups
+
+        current_group = account['group']
+        group_name = st.selectbox(
+            "Оберіть групу:",
+            groups,
+            index=groups.index(current_group) if current_group in groups else 0,
+            key=f"edit_group_select_{account_index}"
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            is_admin = st.checkbox("Адміністративний акаунт", value=account.get('is_admin', False))
+        with col2:
+            skip_check = st.checkbox("Не перевіряти цей акаунт", value=account.get('skip_check', False))
+
+        col_save, col_cancel = st.columns(2)
+        with col_save:
+            save_button = st.form_submit_button("💾 Зберегти зміни")
+        with col_cancel:
+            cancel_button = st.form_submit_button("❌ Скасувати")
+
+        if save_button:
+            st.session_state.accounts[account_index]['group'] = group_name
+            st.session_state.accounts[account_index]['is_admin'] = is_admin
+            st.session_state.accounts[account_index]['skip_check'] = skip_check
+            st.session_state.stats_updated += 1
+            save_accounts_to_file()
+            st.session_state.active_form = None
+            st.session_state.editing_account_index = None
+            st.success("Акаунт успішно оновлено!")
+            st.rerun()
+
+        if cancel_button:
+            st.session_state.active_form = None
+            st.session_state.editing_account_index = None
+            st.rerun()
+
+def create_new_group_form():
+    with st.form(key='new_group_form'):
+        st.subheader("Створення нової групи")
+        new_group_name = st.text_input("Назва нової групи:")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            create_button = st.form_submit_button("✅ Створити групу")
+        with col2:
+            cancel_button = st.form_submit_button("❌ Скасувати")
+
+        if create_button:
+            if not new_group_name:
+                st.error("Будь ласка, введіть назву групи")
+                return
+
+            if new_group_name in st.session_state.groups:
+                st.error("Група з такою назвою вже існує")
+                return
+
+            st.session_state.groups.append(new_group_name)
+            st.session_state.groups.sort()
+            save_accounts_to_file()
+            st.session_state.active_form = None
+            st.success(f"Група '{new_group_name}' успішно створена!")
+            st.rerun()
+
+        if cancel_button:
+            st.session_state.active_form = None
+            st.rerun()
+
+def manage_groups_form():
+    st.subheader("Керування групами")
+
+    if not st.session_state.groups:
+        st.info("Немає створених груп")
+        return
+
+    selected_group = st.selectbox(
+        "Оберіть групу:",
+        st.session_state.groups,
+        key="group_management_select"
+    )
+
+    group_in_use = any(acc['group'] == selected_group for acc in st.session_state.accounts)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("✏️ Перейменувати групу", use_container_width=True, key="rename_group_btn"):
+            st.session_state.editing_group = selected_group
+            st.rerun()
+    with col2:
+        if st.button("🗑️ Видалити групу", use_container_width=True, key="delete_group_btn"):
+            st.session_state.group_to_delete = selected_group
+            st.rerun()
+
+    if st.session_state.group_to_delete == selected_group:
+        st.warning(f"Ви впевнені, що хочете видалити групу '{selected_group}'?")
+        st.warning("Ця дія видалить усі акаунти, що належать до цієї групи!")
+
+        accounts_in_group = [acc for acc in st.session_state.accounts if acc['group'] == selected_group]
+        if accounts_in_group:
+            st.error(f"Увага: ця група містить {len(accounts_in_group)} акаунт(ів), які будуть видалені!")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Так, видалити групу", key="confirm_delete_group", type="primary"):
+                st.session_state.accounts = [acc for acc in st.session_state.accounts if acc['group'] != selected_group]
+                st.session_state.groups.remove(selected_group)
+                st.session_state.groups.sort()
+                save_accounts_to_file()
+                st.session_state.group_to_delete = None
+                st.session_state.active_form = None
+                st.success(f"Група '{selected_group}' та всі її акаунти успішно видалені!")
+                st.rerun()
+        with col2:
+            if st.button("❌ Скасувати видалення", key="cancel_delete_group"):
+                st.session_state.group_to_delete = None
+                st.rerun()
+
+    if st.session_state.get('editing_group') == selected_group:
+        with st.form(key='rename_group_form'):
+            st.subheader(f"Перейменування групи: {st.session_state.editing_group}")
+            new_name = st.text_input("Нова назва групи:", value=st.session_state.editing_group)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                rename_button = st.form_submit_button("💾 Зберегти зміни")
+            with col2:
+                cancel_button = st.form_submit_button("❌ Скасувати")
+
+            if rename_button:
+                if not new_name:
+                    st.error("Будь ласка, введіть нову назву групи")
+                    return
+
+                if new_name in st.session_state.groups:
+                    st.error("Група з такою назвою вже існує")
+                    return
+
+                for account in st.session_state.accounts:
+                    if account['group'] == st.session_state.editing_group:
+                        account['group'] = new_name
+
+                st.session_state.groups.remove(st.session_state.editing_group)
+                st.session_state.groups.append(new_name)
+                st.session_state.groups.sort()
+                save_accounts_to_file()
+                st.session_state.editing_group = None
+                st.success(f"Група успішно перейменована на '{new_name}'!")
+                st.rerun()
+
+            if cancel_button:
+                st.session_state.editing_group = None
+                st.rerun()
+
+async def main_ui():
+    st.title("📊 Моніторинг повідомлень Telegram")
+    init_session_state()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("➕ Додати новий акаунт", use_container_width=True, key="add_account_btn"):
+            st.session_state.active_form = 'add_account'
+            st.session_state.login_stage = 'start'
+            st.session_state.editing_account_index = None
+            st.rerun()
+    with col2:
+        if st.button("🏗️ Додати нову групу", use_container_width=True, key="add_group_btn"):
+            st.session_state.active_form = 'add_group'
+            st.session_state.login_stage = 'start'
+            st.session_state.editing_account_index = None
+            st.rerun()
+
+    if st.button("👥 Керування групами", use_container_width=True, key="manage_groups_btn"):
+        if st.session_state.active_form == 'manage_groups':
+            st.session_state.active_form = None
+        else:
+            st.session_state.active_form = 'manage_groups'
+        st.rerun()
+
+    if st.session_state.active_form == 'add_account':
+        with st.expander("Додати новий акаунт", expanded=True):
+            await login()
+    elif st.session_state.active_form == 'add_group':
+        with st.expander("Створення нової групи", expanded=True):
+            create_new_group_form()
+    elif st.session_state.active_form == 'manage_groups':
+        with st.expander("Керування групами", expanded=True):
+            manage_groups_form()
+    elif st.session_state.editing_account_index is not None:
+        with st.expander(f"Редагування акаунта", expanded=True):
+            edit_account_form(st.session_state.editing_account_index)
+
+    st.subheader("Ваші акаунти")
+
+    if st.button("🔄 Оновити всі акаунти", use_container_width=True, key="update_accounts_btn"):
+        await update_all_accounts()
+        st.rerun()
+
+    display_accounts_table()
+
+    if st.session_state.accounts:
+        st.subheader("Керування акаунтами")
+        account_names = [f"{acc['group']} - {acc['name']}" for acc in st.session_state.accounts]
+        selected_account = st.selectbox(
+            "Оберіть акаунт для керування:",
+            account_names,
+            key="account_management_select"
+        )
+
+        if selected_account:
+            acc_index = account_names.index(selected_account)
+            account = st.session_state.accounts[acc_index]
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✏️ Редагувати", use_container_width=True, key=f"edit_btn_{acc_index}"):
+                    st.session_state.active_form = None
+                    st.session_state.editing_account_index = acc_index
+                    st.rerun()
+            with col2:
+                if st.button("🗑️ Видалити", use_container_width=True, key=f"delete_btn_{acc_index}"):
+                    account_name = account['name']
+                    del st.session_state.accounts[acc_index]
+                    groups = set(acc['group'] for acc in st.session_state.accounts)
+                    st.session_state.groups = sorted(groups)
+                    save_accounts_to_file()
+                    st.session_state.stats_updated += 1
+                    st.success(f"Акаунт {account_name} видалено!")
+                    st.rerun()
+
+if __name__ == '__main__':
+    if not st.session_state.loop.is_running():
+        st.session_state.loop.run_until_complete(main_ui())
+    else:
+        asyncio.run_coroutine_threadsafe(main_ui(), st.session_state.loop)
