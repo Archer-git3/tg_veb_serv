@@ -8,6 +8,10 @@ from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 import time
 import pickle
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import pytz
+
 
 # Конфігурація
 API_ID = 29148113
@@ -17,7 +21,6 @@ ACCOUNTS_FILE = "telegram_accounts.json"
 NOTIFICATION_CHATS_FILE = "notification_chats.json"
 SESSION_TIMEOUT = 60
 ACCOUNTS_CHECK_INTERVAL = 30
-
 # Список спеціальних користувачів (user_id)
 SPECIAL_USERS = ["fgtaaaqd", "іншийкористувач"]
 
@@ -28,6 +31,7 @@ admins = set()
 message_queue = asyncio.Queue()
 last_accounts_check = 0
 last_accounts_mtime = 0
+
 
 class AccountClient:
     def __init__(self, account_data):
@@ -70,6 +74,7 @@ class AccountClient:
             await self.client.disconnect()
         self.is_running = False
 
+
 async def load_accounts():
     global last_accounts_mtime, admins
 
@@ -111,37 +116,67 @@ async def load_accounts():
     except Exception:
         return False
 
+
+def format_datetime(raw_dt: str) -> str:
+    # Парсимо дату з ISO-формату
+    dt_utc = datetime.fromisoformat(raw_dt)
+    # Переводимо в Київський час
+    kyiv_tz = pytz.timezone("Europe/Kyiv")
+    dt_kyiv = dt_utc.astimezone(kyiv_tz)
+    # Форматуємо дату в зручному вигляді
+    return dt_kyiv.strftime("%d.%m.%Y %H:%M")
+
 async def send_notification(bot: Bot, chat_id: int, message: dict):
     try:
         first_msg_info = "🌟 **Перше повідомлення!**\n" if message['is_first'] else ""
         special_indicator = "⭐ СПЕЦІАЛЬНИЙ АКАУНТ ⭐\n" if message.get('is_special', False) else ""
-
+        formatted_date = format_datetime(message['date'])
         text = (
             f"🔔 **Нове повідомлення!**\n"
             f"{special_indicator}"
             f"{first_msg_info}"
             f"👤 Акаунт: `{message['account']}`\n"
             f"👤 Відправник: `{message['sender']}`\n"
-            f"📅 Дата: `{message['date']}`\n"
+            f"📅 Дата: `{formatted_date}`\n"
             f"🏷️ Група: `{message['group']}`\n"
             f"\n{message['text']}"
         )
+
         await bot.send_message(
             chat_id=chat_id,
             text=text,
             parse_mode='Markdown'
         )
+
+
+        if message['is_first']:
+            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            creds = ServiceAccountCredentials.from_json_keyfile_name("serviceaccount121-b4e897371ed8.json", scope)
+            client = gspread.authorize(creds)
+            spreadsheet = client.open_by_key("1JI5CfxlZItxTCaIy41Ja_ZMRMwaLzC7WXApiFOhESBg")
+            sheet = spreadsheet.sheet1
+
+            sheet.append_row([
+                message['account'],
+                message['sender'],
+                formatted_date,
+                message['group'],
+                message['text']
+            ])
+
     except Exception:
         pass
+
 
 def get_group_admins(group_name):
     admins_list = []
     for client in clients.values():
         if (client.account_data.get('group') == group_name and
-            client.account_data.get('is_admin', False) and
-            client.me):
+                client.account_data.get('is_admin', False) and
+                client.me):
             admins_list.append(client.me.id)
     return admins_list
+
 
 async def load_notification_chats():
     global notification_chats
@@ -156,12 +191,14 @@ async def load_notification_chats():
     except Exception:
         notification_chats = {}
 
+
 async def save_notification_chats():
     try:
         with open(NOTIFICATION_CHATS_FILE, 'wb') as f:
             pickle.dump(notification_chats, f)
     except Exception:
         pass
+
 
 async def message_listener(client: AccountClient):
     @client.client.on(events.NewMessage(incoming=True))
@@ -172,7 +209,7 @@ async def message_listener(client: AccountClient):
 
             if client.account_data.get('skip_check', False):
                 return
-                
+
             sender = await event.get_sender()
             if isinstance(sender, types.User) and sender.bot:
                 return
@@ -211,16 +248,27 @@ async def message_listener(client: AccountClient):
         except Exception:
             pass
 
-async def is_first_in_dialog(client, user_id):
+
+async def is_first_in_dialog(wrapper_client, user_id):
     try:
-        messages = await client.client.get_messages(
-            user_id,
-            limit=4,
-            reverse=True
-        )
-        return len(messages) < 2
-    except Exception:
+        # Дістаємо внутрішній TelegramClient
+        client = wrapper_client.client
+
+        me = await client.get_me()
+        my_id = me.id
+
+        messages = await client.get_messages(user_id, limit=10)
+
+        # Фільтруємо повідомлення не від нас
+        other_user_messages = [msg for msg in messages if msg.sender_id != my_id]
+
+        return len(other_user_messages) <= 1
+
+    except Exception as e:
+        print("Помилка при перевірці першого повідомлення:", e)
         return False
+
+
 
 async def process_message_queue(bot: Bot):
     while True:
@@ -259,14 +307,18 @@ async def process_message_queue(bot: Bot):
 
         message_queue.task_done()
 
+
 def is_admin(user_id):
     return user_id in admins
+
 
 def has_admin_rights(user_id):
     return user_id in admins or user_id in SPECIAL_USERS
 
+
 async def group_selection_required(update: Update, context: ContextTypes.DEFAULT_TYPE, handler):
     return await handler(update, context)
+
 
 async def admin_required(update: Update, context: ContextTypes.DEFAULT_TYPE, handler):
     user_id = update.effective_user.id
@@ -279,6 +331,7 @@ async def admin_required(update: Update, context: ContextTypes.DEFAULT_TYPE, han
         return None
 
     return await handler(update, context)
+
 
 async def show_accessible_groups(query, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
@@ -312,6 +365,7 @@ async def show_accessible_groups(query, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
         ])
     )
+
 
 async def show_group_selection(query, context: ContextTypes.DEFAULT_TYPE):
     all_groups = set()
@@ -360,6 +414,7 @@ async def show_group_selection(query, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup
     )
 
+
 async def group_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -374,6 +429,7 @@ async def group_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await reset_groups_handler(update, context)
     elif query.data == "back_to_main":
         await start(update, context)
+
 
 async def toggle_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -399,6 +455,7 @@ async def toggle_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await save_notification_chats()
     await show_group_selection(query, context)
 
+
 async def save_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -415,6 +472,7 @@ async def save_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         "Тепер ви будете отримувати сповіщення лише для обраних груп."
     )
 
+
 async def reset_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -428,11 +486,13 @@ async def reset_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.edit_message_text("🧹 Всі групи скинуті! Ви не отримуватимете сповіщень.")
 
+
 def get_admin_group(user_id):
     for client in clients.values():
         if client.me and client.me.id == user_id:
             return client.account_data.get('group', '')
     return None
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
@@ -521,6 +581,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await message.reply_text(text, reply_markup=reply_markup)
 
+
 async def account_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -543,6 +604,7 @@ async def account_group_handler(update: Update, context: ContextTypes.DEFAULT_TY
             ])
         )
 
+
 async def view_account_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -560,6 +622,7 @@ async def view_account_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+
 async def set_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         query = update.callback_query
@@ -568,6 +631,7 @@ async def set_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update.effective_chat = query.message.chat
 
     return await group_selection_required(update, context, _set_groups)
+
 
 async def _set_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
@@ -649,8 +713,10 @@ async def _set_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup
     )
 
+
 async def my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await admin_required(update, context, _my_groups)
+
 
 async def _my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -681,6 +747,7 @@ async def _my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(response, parse_mode='Markdown')
 
+
 async def _toggle_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -705,6 +772,7 @@ async def _toggle_group_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await save_notification_chats()
     await update_group_buttons(query)
 
+
 async def _save_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -721,6 +789,7 @@ async def _save_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         "Тепер ви будете отримувати сповіщення лише для обраних груп."
     )
 
+
 async def _reset_groups_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -733,6 +802,7 @@ async def _reset_groups_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await save_notification_chats()
 
     await query.edit_message_text("🧹 Всі групи скинуті! Ви не отримуватимете сповіщень.")
+
 
 async def update_group_buttons(query):
     chat_id = query.message.chat_id
@@ -789,8 +859,10 @@ async def update_group_buttons(query):
         reply_markup=reply_markup
     )
 
+
 async def check_unread(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await admin_required(update, context, _check_unread)
+
 
 async def _check_unread(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -837,6 +909,7 @@ async def _check_unread(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await message.reply_text(message_text, reply_markup=reply_markup)
 
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
@@ -877,6 +950,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
     elif query.data == "view_account_group":
         await view_account_group(update, context)
+
 
 async def handle_unread_messages(query, context: ContextTypes.DEFAULT_TYPE):
     bot = context.bot
@@ -1002,11 +1076,13 @@ async def handle_unread_messages(query, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown'
             )
 
+
 async def manage_special(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in SPECIAL_USERS:
         await update.message.reply_text("❌ Ця команда доступна тільки для спеціальних користувачів!")
         return
+
 
 async def _manage_special(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
@@ -1025,8 +1101,10 @@ async def _manage_special(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup
     )
 
+
 async def toggle_special_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await admin_required(update, context, _toggle_special_handler)
+
 
 async def _toggle_special_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1039,6 +1117,7 @@ async def _toggle_special_handler(update: Update, context: ContextTypes.DEFAULT_
         client.is_special = not client.is_special
         client.account_data['is_special'] = client.is_special
         await update_special_buttons(query)
+
 
 async def update_special_buttons(query):
     keyboard = []
@@ -1056,6 +1135,7 @@ async def update_special_buttons(query):
         "Оберіть акаунт, щоб змінити його статус:",
         reply_markup=reply_markup
     )
+
 
 async def save_special_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1080,6 +1160,7 @@ async def save_special_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         await query.edit_message_text("❌ Помилка збереження")
 
+
 async def check_accounts_updates():
     global last_accounts_check
 
@@ -1093,6 +1174,7 @@ async def check_accounts_updates():
         except Exception:
             pass
 
+
 async def main():
     await load_notification_chats()
     application = Application.builder().token(BOT_TOKEN).build()
@@ -1103,9 +1185,10 @@ async def main():
     application.add_handler(CommandHandler("my_groups", my_groups))
     application.add_handler(CommandHandler("check_unread", check_unread))
     application.add_handler(CommandHandler("manage_special", manage_special))
-    
+
     application.add_handler(CommandHandler("set_groups",
-        lambda update, context: group_selection_required(update, context, set_groups)))
+                                           lambda update, context: group_selection_required(update, context,
+                                                                                            set_groups)))
 
     application.add_handler(CallbackQueryHandler(
         lambda update, context: group_selection_required(update, context, toggle_group_handler),
@@ -1118,7 +1201,7 @@ async def main():
     application.add_handler(CallbackQueryHandler(
         lambda update, context: group_selection_required(update, context, reset_groups_handler),
         pattern="^reset_groups$"))
-        
+
     application.add_handler(CallbackQueryHandler(button_handler, pattern="^check_now$"))
     application.add_handler(CallbackQueryHandler(toggle_group_handler, pattern="^toggle_group:"))
     application.add_handler(CallbackQueryHandler(save_groups_handler, pattern="^save_groups$"))
@@ -1132,7 +1215,7 @@ async def main():
         lambda update, context: group_selection_required(update, context, group_button_handler),
         pattern="^(toggle_group|save_groups|reset_groups|back_to_main)"
     ))
-    
+
     for client in clients.values():
         if client.is_running:
             asyncio.create_task(message_listener(client))
@@ -1156,5 +1239,7 @@ async def main():
         for client in clients.values():
             await client.stop()
 
+
 if __name__ == "__main__":
     asyncio.run(main())
+
